@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin · Juragan Laundry</title>
+<meta name="robots" content="noindex">
+<style>
+:root{color-scheme:light;--navy:#142B4A;--line:#dbe4f0;--teal:#2563EB;--muted:#64748b}
+*{box-sizing:border-box}
+body{margin:0;background:#eef3fb;color:var(--navy);font:15px/1.45 Nunito,system-ui,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:10px 18px;background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+header img{width:38px;height:38px}header b{font-size:18px}header small{display:block;color:var(--muted);font-size:12px}
+header .sp{margin-left:auto;display:flex;gap:8px;align-items:center;font-size:13px}
+main{max-width:1000px;margin:0 auto;padding:16px}
+.card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px}
+.tabs{display:flex;gap:4px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:4px;margin-bottom:12px}
+.tabs button{flex:1;border:0;background:none;border-radius:9px;padding:9px;font:800 14px Nunito,sans-serif;color:var(--navy);cursor:pointer}
+.tabs button.on{background:var(--teal);color:#fff}
+.btn{border:0;border-radius:10px;padding:9px 16px;font:800 14px Nunito,sans-serif;cursor:pointer;background:var(--teal);color:#fff}
+.btn.sec{background:#eef3fb;color:var(--navy);border:1px solid var(--line)}
+.center{max-width:440px;margin:60px auto;text-align:center}.center p{color:var(--muted)}
+.err{color:#dc2626;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px}
+td input{width:120px;border:1px solid #cbd5e1;border-radius:8px;padding:5px 7px;font:700 13px Nunito,sans-serif}
+.note{color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<header><img src="assets/icons/logo.png" alt=""><div><b>Admin Juragan Laundry</b><small>Keseimbangan game & top-up</small></div><div class="sp" id="who"></div></header>
+<main id="app"><div class="center"><p>Memuat…</p></div></main>
+<script src="config.js"></script>
+<script src="balance.js"></script>
+<script>
+const J=window.JL_CONFIG||{},API=(J.backendUrl||'').replace(/\/$/,''),CID=J.googleClientId||'';
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let token=localStorage.getItem('jl.session')||'',me=null,tab='bal';
+async function api(path,opt={}){const r=await fetch(API+path,{...opt,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})}});
+  let j=null;try{j=await r.json()}catch(e){}if(!r.ok){const e=new Error((j&&j.error)||'http_'+r.status);e.status=r.status;throw e}return j||{}}
+function view(html){$('#app').innerHTML=html}
+function gate(msg){view(`<div class="center card"><img src="assets/icons/logo.png" width="64" height="64" alt=""><h2>Masuk sebagai admin</h2><p>Gunakan akun Google yang terdaftar di <code>ADMIN_EMAILS</code> pada backend.</p><div id="gBtn" style="display:flex;justify-content:center;margin:12px 0"></div><p class="err">${esc(msg||'')}</p></div>`);
+  const s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.onload=()=>{google.accounts.id.initialize({client_id:CID,ux_mode:'popup',callback:async resp=>{
+    try{const j=await api('/api/auth/google',{method:'POST',body:JSON.stringify({credential:resp.credential})});token=j.token;localStorage.setItem('jl.session',token);localStorage.setItem('jl.user',JSON.stringify(j.user));start()}
+    catch(e){gate('Login ditolak atau server tidak bisa dihubungi.')}}});google.accounts.id.renderButton($('#gBtn'),{theme:'filled_blue',size:'large',shape:'pill',locale:'id'})};document.head.appendChild(s)}
+async function start(){
+  if(!API||!CID){view(`<div class="center card"><h2>Backend belum disiapkan</h2><p>Isi <b>backendUrl</b> dan <b>googleClientId</b> di <code>config.js</code>. Halaman admin hanya tersedia di versi host sendiri. Di versi Claude, buka menu ☰ → Admin → Keseimbangan game.</p></div>`);return}
+  if(!token)return gate();
+  try{me=await api('/api/admin/check')}catch(e){if(e.status===401){token='';localStorage.setItem('jl.session','');return gate()}view(`<div class="center card"><h2>Server tidak bisa dihubungi</h2><p>Pastikan backend berjalan di <code>${esc(API)}</code>.</p></div>`);return}
+  $('#who').innerHTML=`<span>${esc(me.name||'')} · ${esc(me.email||'')}</span><button class="btn sec" id="out">Keluar</button><a class="btn sec" href="./" style="text-decoration:none">Buka game</a>`;
+  $('#out').onclick=()=>{api('/api/logout',{method:'POST'}).catch(()=>{});localStorage.setItem('jl.session','');location.reload()};
+  if(!me.admin){view(`<div class="center card"><h2>Bukan akun admin</h2><p>${esc(me.email)} tidak terdaftar di <code>ADMIN_EMAILS</code> pada <code>wrangler.toml</code>.</p></div>`);return}
+  render()}
+async function render(){
+  view(`<div class="tabs"><button data-t="bal" class="${tab==='bal'?'on':''}">Keseimbangan game</button><button data-t="topup" class="${tab==='topup'?'on':''}">Top-up tanpa ID</button></div><div class="card" id="pane">Memuat…</div>`);
+  document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;render()});
+  if(tab==='bal'){const d=await api('/api/balance');const opt={values:d.values,version:d.version,log:d.log,
+      async onSave(values,changes,note){try{const r=await api('/api/admin/balance',{method:'POST',body:JSON.stringify({base:opt.version,values,changes,note})});
+          opt.values=values;opt.log.unshift({version:r.version,note,changes,by:me.email,at:Date.now()});opt.version=r.version}
+        catch(e){throw new Error(e.status===409?'conflict':e.message)}}};
+    $('#pane').innerHTML='<p class="note" style="margin-top:0">Ubah angka lalu terbitkan sebagai versi baru. Pemain mendapat nilai baru saat membuka game dan melihat ringkasan perubahannya. Nilai bawaan diambil dari kode game.</p><div id="ed"></div>';
+    JL_BALANCE_EDITOR($('#ed'),opt)}
+  else{const d=await api('/api/admin/unmatched');const L=d.credits||[];
+    $('#pane').innerHTML=`<h3 style="margin-top:0">Catat pembayaran manual</h3>
+      <p class="note">Pakai ini kalau pembayaran Saweria sudah berhasil tapi diamond tidak masuk (misalnya webhook belum terpasang atau backend belum online). Cek dulu pembayarannya di dashboard Saweria. Diamond masuk ke pemain dalam ±15 detik.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px">
+        <label>ID Pemain<br><input id="mcCode" placeholder="JL-XXXXXX" style="width:130px;border:1px solid #cbd5e1;border-radius:8px;padding:7px"></label>
+        <label>Nominal (Rp)<br><input id="mcAmt" type="number" min="1000" step="1000" placeholder="29000" style="width:130px;border:1px solid #cbd5e1;border-radius:8px;padding:7px"></label>
+        <label>Jenis<br><select id="mcType" style="border:1px solid #cbd5e1;border-radius:8px;padding:7px"><option value="topup">Top-up diamond</option><option value="donasi">Donasi</option></select></label>
+        <label style="flex:1;min-width:180px">Catatan<br><input id="mcNote" placeholder="mis. Saweria 27/11 pukul 12.30" style="width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:7px"></label>
+        <button class="btn" id="mcGo">Catat</button></div><p id="mcMsg" class="note"></p>
+      <h3>Top-up tanpa ID Pemain</h3><p class="note" style="margin-top:0">Pembayaran Saweria yang pesannya tidak memuat ID Pemain (JL-XXXXXX). Isi ID Pemain yang benar agar diamond masuk ke akunnya.</p>
+      ${L.length?`<table><thead><tr><th>Waktu</th><th>Pengirim</th><th>Jumlah</th><th>Pesan</th><th>ID Pemain</th><th></th></tr></thead><tbody>${L.map(c=>`<tr><td>${new Date(c.created_at).toLocaleString('id-ID')}</td><td>${esc(c.donator)}</td><td>Rp${Number(c.amount).toLocaleString('id-ID')}</td><td>${esc(c.message)}</td><td><input placeholder="JL-XXXXXX" data-id="${esc(c.id)}"></td><td><button class="btn" data-as="${esc(c.id)}">Tetapkan</button></td></tr>`).join('')}</tbody></table>`:'<p>Tidak ada top-up yang belum tertaut.</p>'}<p class="err" id="aerr"></p>`;
+    $('#mcGo').onclick=async()=>{const code=$('#mcCode').value.trim().toUpperCase(),amount=+$('#mcAmt').value,m=$('#mcMsg');
+      if(!/^JL-[A-HJ-NP-Z2-9]{6}$/.test(code)||!(amount>0)){m.className='err';m.textContent='Isi ID Pemain (JL-XXXXXX) dan nominal yang benar.';return}
+      if(!confirm(`Catat ${$('#mcType').value==='donasi'?'donasi':'top-up'} Rp${amount.toLocaleString('id-ID')} untuk ${code}?`))return;
+      try{await api('/api/admin/credit',{method:'POST',body:JSON.stringify({code,amount,type:$('#mcType').value,note:$('#mcNote').value})});m.className='note';m.style.color='#16a34a';m.textContent=`Tercatat. Diamond untuk ${code} masuk saat game pemain itu terbuka.`;$('#mcAmt').value='';$('#mcNote').value=''}
+      catch(e){m.className='err';m.textContent='Gagal mencatat: '+e.message}};
+    document.querySelectorAll('[data-as]').forEach(b=>b.onclick=async()=>{const code=document.querySelector(`input[data-id="${b.dataset.as}"]`).value.trim().toUpperCase();
+      try{await api('/api/admin/assign',{method:'POST',body:JSON.stringify({id:b.dataset.as,code})});render()}catch(e){$('#aerr').textContent='Gagal: pastikan format ID Pemain JL-XXXXXX.'}})}}
+start();
+</script>
+</body>
+</html>

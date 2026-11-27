@@ -1,0 +1,13 @@
+name = "juragan-laundry-api"
+main = "src/worker.js"
+compatibility_date = "2026-11-01"
+
+[vars]
+ALLOWED_ORIGIN = "http://localhost:8000,http://127.0.0.1:8000,https://juragan-laundry.pages.dev"   # alamat game-mu; boleh beberapa, pisahkan koma
+ADMIN_EMAILS = "ananbkhoir@gmail.com,anan.lemhannas.2025@gmail.com"   # email Google admin untuk admin.html
+GOOGLE_CLIENT_ID = "992175212524-ac4q6js15a0t6o40gnrgrfpe3fj89grm.apps.googleusercontent.com"   # OAuth Client ID (Web) dari Google Cloud Console
+
+[[d1_databases]]
+binding = "DB"
+database_name = "juragan-laundry"
+database_id = "ISI_DARI_wrangler_d1_create"

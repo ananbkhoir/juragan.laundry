@@ -1,0 +1,26 @@
+import { DatabaseSync } from 'node:sqlite';
+import fs from 'node:fs'; import crypto from 'node:crypto';
+import worker,{_test} from '../src/worker.js';
+const sql=new DatabaseSync(':memory:'); sql.exec(fs.readFileSync('../schema.sql','utf8'));
+const DB={prepare:(q)=>{let args=[];const st=sql.prepare(q.replace(/\?\d+/g,m=>'?'+m.slice(1)));const o={bind:(...a)=>{args=a;return o},
+  run:async()=>{const r=st.run(...args);return{meta:{changes:Number(r.changes)}}},first:async()=>st.get(...args)??null,all:async()=>({results:st.all(...args)})};return o}};
+const env={DB,SAWERIA_STREAM_KEY:'sk',ADMIN_KEY:'adm',ALLOWED_ORIGIN:'https://game.test,http://localhost:8099',GOOGLE_CLIENT_ID:'cid.apps.googleusercontent.com',ADMIN_EMAILS:'Boss@x.com'};
+const {publicKey,privateKey}=crypto.generateKeyPairSync('rsa',{modulusLength:2048});
+const jwk={...publicKey.export({format:'jwk'}),kid:'k1',alg:'RS256',use:'sig'};
+globalThis.fetch=async(u)=>new Response(JSON.stringify({keys:[jwk]}),{status:200});
+const b64=o=>Buffer.from(typeof o==='string'?o:JSON.stringify(o)).toString('base64url');
+const idt=(p,key=privateKey,kid='k1')=>{const h=b64({alg:'RS256',kid,typ:'JWT'}),b=b64({iss:'https://accounts.google.com',aud:env.GOOGLE_CLIENT_ID,exp:Math.floor(Date.now()/1000)+600,iat:Math.floor(Date.now()/1000),...p});
+  const sig=crypto.sign('RSA-SHA256',Buffer.from(h+'.'+b),key).toString('base64url');return h+'.'+b+'.'+sig};
+const call=async(path,opt={},tok)=>{const r=await worker.fetch(new Request('https://w.test'+path,{...opt,headers:{'Content-Type':'application/json','Origin':'http://localhost:8099',...(tok?{Authorization:'Bearer '+tok}:{}),...(opt.headers||{})}}),env);let j=null;try{j=await r.json()}catch{};return{s:r.status,j,cors:r.headers.get('Access-Control-Allow-Origin')}};
+const login=(p)=>call('/api/auth/google',{method:'POST',body:JSON.stringify({credential:idt(p)})});
+let r=await login({sub:'1',email:'boss@x.com',name:'Boss'});const ADM=r.j.token;
+r=await login({sub:'2',email:'p@x.com',name:'Pemain'});const PL=r.j.token;
+console.log('empty',JSON.stringify((await call('/api/balance')).j));
+console.log('check adm',JSON.stringify((await call('/api/admin/check',{},ADM)).j),'pl',JSON.stringify((await call('/api/admin/check',{},PL)).j));
+console.log('player put',(await call('/api/admin/balance',{method:'POST',body:JSON.stringify({base:0,values:{a:1}})},PL)).s);
+console.log('noauth put',(await call('/api/admin/balance',{method:'POST',body:JSON.stringify({base:0,values:{a:1}})})).s);
+console.log('adm put',JSON.stringify((await call('/api/admin/balance',{method:'POST',body:JSON.stringify({base:0,values:{'item.rack_dry.time':25,'bad key!':3,'x':'str'},note:'jemuran lebih cepat',changes:[{key:'item.rack_dry.time',label:'Jemuran',from:30,to:25}]})},ADM)).j));
+console.log('stale base',(await call('/api/admin/balance',{method:'POST',body:JSON.stringify({base:0,values:{}})},ADM)).s);
+console.log('adm put2',JSON.stringify((await call('/api/admin/balance',{method:'POST',body:JSON.stringify({base:1,values:{'item.rack_dry.time':28},note:'koreksi'})},ADM)).j));
+console.log('get',JSON.stringify((await call('/api/balance')).j));
+console.log('adminkey unmatched',(await call('/api/admin/unmatched',{headers:{Authorization:'Bearer adm'}})).s,'session unmatched',(await call('/api/admin/unmatched',{},ADM)).s,'player',(await call('/api/admin/unmatched',{},PL)).s);
