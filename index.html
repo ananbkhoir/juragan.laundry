@@ -495,7 +495,10 @@ const ITEMS={
   scale_ind:{name:'Timbangan Platform Industri',cat:'timbangan',kind:'scale',tier:4,draw:'scale',style:'industrial',price:8000000,lvl:5,sc:{cap:1000,acc:4,spd:4,dur:5,auto:3,pos:3},desc:'Untuk volume besar seperti kontrak hotel.'},
   scale_smart:{name:'Sistem Timbang Pintar',cat:'timbangan',kind:'scale',tier:3,draw:'scale',style:'smart',price:15000000,lvl:6,sc:{cap:300,acc:5,spd:5,dur:4,auto:5,pos:5},desc:'Menimbang sendiri tanpa operator dan langsung tersinkron ke POS.'},
   basket:{name:'Keranjang Cucian Kotor',cat:'simpan',kind:'basket',tier:0,draw:'basket',style:'woven',price:120000,lvl:1,cap:5,desc:'Tempat cucian pelanggan yang sudah ditimbang menunggu giliran dicuci. Tanpa keranjang, cucian ditumpuk di meja kasir (maks. 3).',pros:'Murah, muat 5 pesanan',cons:'Kecil'},
+  basket_m:{name:'Keranjang Plastik Susun',cat:'simpan',kind:'basket',tier:1,draw:'basket',style:'stack',price:350000,lvl:1,cap:8,desc:'Tiga keranjang plastik bertumpuk dalam satu petak untuk antrean cucian kotor.',pros:'Muat 8, ringkas',cons:'Belum dipisah per layanan'},
   basket_l:{name:'Troli Keranjang Besar',cat:'simpan',kind:'basket',tier:2,draw:'basket',style:'cart',price:850000,lvl:2,cap:12,desc:'Troli beroda dengan kantong besar untuk antrean cucian kotor.',pros:'Muat 12 pesanan',cons:'Butuh tempat'},
+  basket_r:{name:'Rak Keranjang Bersekat',cat:'simpan',kind:'basket',tier:3,draw:'basket',style:'rack',price:2200000,lvl:1,cap:18,desc:'Rak bersekat dengan keranjang berlabel per layanan. Karyawan langsung tahu cucian mana yang dicuci duluan.',pros:'Muat 18, rapi per layanan',cons:'Mahal'},
+  basket_x:{name:'Bin Sortir Industri',cat:'simpan',kind:'basket',tier:4,draw:'basket',style:'bin',price:6500000,lvl:1,cap:30,desc:'Bin besar beroda untuk volume kontrak hotel dan restoran.',pros:'Muat 30',cons:'Paling mahal'},
   store_p:{name:'Rak Plastik Susun',cat:'simpan',kind:'store',tier:0,draw:'store',style:'plastic',price:150000,lvl:1,cap:4,find:1.5,desc:'Rak plastik tiga susun ala rumahan untuk menaruh cucian yang sudah jadi.',pros:'Murah, cocok untuk laundry rumahan',cons:'Hanya muat 4 pesanan, tanpa nomor'},
   store_s:{name:'Rak Besi 3 Susun',cat:'simpan',kind:'store',tier:1,draw:'store',style:'iron',price:400000,lvl:1,cap:6,find:1.2,desc:'Tempat cucian yang sudah jadi menunggu diambil pelanggan.',pros:'Murah, muat 6 pesanan',cons:'Tanpa nomor, kasir lebih lama mencari'},
   store_m:{name:'Rak Kayu 5 Susun',cat:'simpan',kind:'store',tier:1,draw:'store',style:'wood',price:900000,lvl:1,cap:10,find:.9,amb:1,desc:'Rak kayu bertingkat untuk cucian jadi.',pros:'Muat 10 pesanan, tampak rapi',cons:'Pencarian biasa saja'},
@@ -1869,6 +1872,16 @@ const atCapacity=()=>openLoad()>=capLimit();
 // usaha rumahan memakai rumah sendiri: hanya biaya rumah (listrik & air rumah) setengah sewa
 const rentDaily=()=>(CFG.rentBase+S.lot*CFG.rentPerLot)*((S.tier||0)===0&&!S.lot?.5:1);
 const COUNTER_PILE=3;
+const UPG_CHAINS=[['basket','basket_m','basket_l','basket_r','basket_x'],['store_p','store_s','store_m','store_l','store_x'],['supply','supply_cab','supply_wh','supply_tank']];
+function upgNext(it){for(const ch of UPG_CHAINS){const i=ch.indexOf(it.type);if(i>=0&&i<ch.length-1)return ch[i+1]}return null}
+const upgCost=(a,b)=>Math.max(0,ITEMS[b].price-ITEMS[a].price);
+function upgBtn(it){const nx=upgNext(it);if(!nx)return '';const d=ITEMS[nx],lock=!tierOk(d.tier)||S.lvl<(d.lvl||1),c=upgCost(it.type,nx);
+  return `<button class="btn sm ${lock?'':'pri'}" data-act="upgrade:${it.id}" ${lock?'disabled':''} title="${esc(d.name)}${d.cap?' · muat '+d.cap:''}">${lock?`Upgrade · ${TIERS[d.tier].icon} ${TIERS[d.tier].name.replace(' Laundry','').replace('Laundry ','')}`:`Upgrade ke ${esc(d.name)} · ${rpS(c)}`}</button>`}
+function upgradeItem(it){const nx=upgNext(it);if(!nx)return;const d=ITEMS[nx],c=upgCost(it.type,nx);
+  if(!tierOk(d.tier)||S.lvl<(d.lvl||1)){toast('Belum terbuka di kelas usaha ini','bad');return}
+  const why=canPlace(nx,it.x,it.y,it.rot,it.id);if(why){toast(`Tidak muat di posisi ini: ${why}`,'bad');return}
+  if(!Economy.spend('coin',c,`Upgrade ${ITEMS[it.type].name} → ${d.name}`)){toast('Kas tidak cukup','bad');return}
+  const old=ITEMS[it.type].name;it.type=nx;R.nav=rebuildNav();repathAll();R.thumbsDirty=true;Sfx.play('reward');toast(`${old} di-upgrade menjadi ${d.name}`,'good');Missions.track('build');Saves.dirty=true;renderInspect();renderPanel()}
 const basketUsed=it=>S.orders.filter(o=>o.at===it.id).length+S.staff.filter(x=>{const j=rt(x).job;return j&&j.type==='intake'&&j.basket===it.id}).length;
 function pickBasket(){const c=counter(),from=c&&R.nav.access[c.id];const L=S.items.filter(it=>ITEMS[it.type].kind==='basket'&&R.nav.access[it.id]&&!it._moving&&basketUsed(it)<ITEMS[it.type].cap);
   if(from)L.sort((a,b)=>dd(R.nav.access[a.id],from)-dd(R.nav.access[b.id],from));return L[0]||null}
@@ -2598,7 +2611,18 @@ function drawItem(it,ghost){
     case 'garment':{const pc=['#94a3b8','#64748b','#475569'];boxL(it,.1,.9,.38,.62,0,3,...pc);boxL(it,.12,.18,.45,.55,0,40,...pc);boxL(it,.82,.88,.45,.55,0,40,...pc);boxL(it,.1,.9,.47,.53,38,3,...pc);
       const n=S&&!ghost&&S.orders.some(o=>o.at===it.id)?6:3;for(let i=0;i<n;i++){const u=.24+i*(.56/(n-1||1)),q=LP(it,u,.5);g.strokeStyle='#334155';g.lineWidth=1;g.beginPath();g.moveTo(q.x,q.y-40);g.lineTo(q.x,q.y-36);g.stroke();
         g.fillStyle=CLOTH[(i+2)%5];poly([q.x-5,q.y-36,q.x+5,q.y-36,q.x+6,q.y-20,q.x-6,q.y-20],CLOTH[(i+2)%5],'rgba(0,0,0,.15)')}break}
-    case 'basket':{const cart=ITEMS[it.type].style==='cart',cnt=S&&!ghost?S.orders.filter(o=>o.at===it.id).length:2,cap=ITEMS[it.type].cap;
+    case 'basket':{const bs=ITEMS[it.type].style,cart=bs==='cart',cnt=S&&!ghost?S.orders.filter(o=>o.at===it.id).length:2,cap=ITEMS[it.type].cap;
+      if(bs==='stack'||bs==='rack'||bs==='bin'){const LV=bs==='stack'?[0,12,24]:bs==='rack'?[0,16,32]:[0],HH=bs==='bin'?34:bs==='rack'?7:11,C3=bs==='stack'?['#60a5fa','#3b82f6','#2563eb']:bs==='rack'?['#a7f3d0','#6ee7b7','#34d399']:['#fcd34d','#f59e0b','#d97706'],U0=bs==='bin'?.1:.16,U1=bs==='bin'?.9:.84;
+        if(bs==='rack'){for(const [u,v] of [[.12,.12],[.88,.12],[.12,.88],[.88,.88]]){const q=L(it,u-.03,u+.03,v-.03,v+.03);boxR(q[0],q[1],q[2],q[3],0,46,'#94a3b8','#64748b','#475569')}}
+        if(bs==='bin'){for(const [u,v] of [[.18,.18],[.82,.18],[.18,.82],[.82,.82]]){const t=LP(it,u,v);g.fillStyle='#1f2937';circ(t.x,t.y-2,2.8)}}
+        const top=LV.length-1;LV.forEach((lift,li)=>{const z=lift+(bs==='bin'?5:2);boxL(it,U0,U1,U0,U1,z,HH,...C3);
+          if(bs!=='rack'&&li===top)boxL(it,U0+.06,U1-.06,U0+.06,U1-.06,z+HH-.5,1,'rgba(15,23,42,.35)','rgba(15,23,42,.2)','rgba(15,23,42,.2)');
+          if(bs==='stack'){const f=LP(it,.5,U1);g.fillStyle='rgba(15,23,42,.35)';rr(f.x-5,f.y-z-HH*.65,10,3,1.5);g.fill()}
+          const show=bs==='rack'?Math.max(0,Math.min(3,cnt-li*Math.ceil(cap/3))):li===top?Math.min(3,cnt):0;
+          for(let i=0;i<show;i++){const t=LP(it,.32+i*.18,.5);g.fillStyle=CLOTH[(i+li)%5];g.beginPath();g.ellipse(t.x,t.y-z-HH-2.5,5.5,3,0,0,7);g.fill();g.fillStyle='rgba(255,255,255,.35)';g.beginPath();g.ellipse(t.x-1.5,t.y-z-HH-3.2,2.2,1,0,0,7);g.fill()}
+          if(bs==='rack'){const t=LP(it,.5,U1);g.fillStyle='#fff';g.fillRect(t.x-6,t.y-z-HH+1,12,5);g.fillStyle=['#2563eb','#db2777','#16a34a'][li];g.fillRect(t.x-5,t.y-z-HH+2,10,3)}});
+        const H=LV.at(-1)+HH+6;if(S&&!ghost&&cnt>=cap){const t=P(it.x+.5,it.y+.5);g.fillStyle='#ef5a45';circ(t.x,t.y-H-14,7);g.fillStyle='#fff';g.font='800 11px Nunito, sans-serif';g.textAlign='center';g.fillText('!',t.x,t.y-H-10);g.textAlign='left'}
+        break}
       if(cart){for(const [u,v] of [[.22,.22],[.78,.22],[.22,.78],[.78,.78]]){const t=LP(it,u,v);g.fillStyle='#334155';circ(t.x,t.y-2,2.5)}
         boxL(it,.15,.85,.15,.85,6,4,'#94a3b8','#64748b','#475569');boxL(it,.18,.82,.18,.82,10,26,'#60a5fa','#3b82f6','#2563eb')}
       else{boxL(it,.2,.8,.2,.8,0,22,'#e7c58f','#c9a063','#b38a52');const b0=LP(it,.5,.5);g.strokeStyle='rgba(120,80,30,.35)';g.lineWidth=1;for(let i=1;i<4;i++){g.beginPath();g.moveTo(b0.x-17,b0.y-i*5.5);g.lineTo(b0.x+17,b0.y-i*5.5);g.stroke()}}
@@ -3755,7 +3779,7 @@ function renderInspect(){
   if(it.type==='areasign')st=`Tulisan: <b>${esc(it.label||'Kasir')}</b></p><div class="chips" style="margin:6px 0 0">${ASIGN.map((l,i)=>`<button class="chip ${(it.label||'Kasir')===l?'on':''}" data-act="signl:${it.id}~${i}">${l}</button>`).join('')}</div><p>`;
   const html=`<h3>${esc(d.name)}</h3><p>${st}</p>${o?`<div class="prog"><i style="width:${clamp(p,0,1)*100}%"></i></div>`:''}
    <div class="row" style="margin-top:8px">${o&&o.status==='processing'?`<button class="btn sun sm" data-act="speed:${it.id}">Selesaikan · ${GEM} ${CFG.speedupGem}</button>`:''}
-   ${it.broken?`<button class="btn sun sm" data-act="repair:${it.id}">Perbaiki · ${rpS(Math.round(d.price*.12/1000)*1000)}</button>`:''}<button class="btn sm" data-act="move:${it.id}">Pindahkan</button><button class="btn sm" data-act="rotate:${it.id}">Putar</button>
+   ${upgBtn(it)}${it.broken?`<button class="btn sun sm" data-act="repair:${it.id}">Perbaiki · ${rpS(Math.round(d.price*.12/1000)*1000)}</button>`:''}<button class="btn sm" data-act="move:${it.id}">Pindahkan</button><button class="btn sm" data-act="rotate:${it.id}">Putar</button>
    ${it.type!=='counter'?`<button class="btn bad sm" data-act="sell:${it.id}">Jual${(d.cur||'coin')==='coin'?' +'+rpS(d.price*.5):''}</button>`:''}<button class="btn sm" data-act="close">Tutup</button></div>`;
   if(el._last!==html){el._last=html;el.innerHTML=html}el.hidden=false;
 }
@@ -3828,7 +3852,7 @@ document.addEventListener('click',e=>{
     intakechk:()=>{S.intakeCheck=S.intakeCheck===false;Saves.dirty=true;toast(S.intakeCheck?'Kasir akan mengecek saku & menghitung potong':'Penerimaan tanpa cek saku & hitung potong',S.intakeCheck?'good':'bad');renderPanel()},
     remind:()=>remindCust(v),donate:()=>openModal('Sumbangkan cucian?','<p>Cucian yang sudah 7 hari lebih tidak diambil disumbangkan ke panti asuhan. Pesanan dihapus; bila belum dibayar, uangnya tidak akan diterima.</p>',[{label:'Batal'},{label:'Sumbangkan',cls:'bad',fn:()=>donateOrder(v)}]),
     kaccept:()=>acceptOffer(v),kdecline:()=>declineOffer(v),kend:()=>openModal('Putus kontrak?','<p>Memutus kontrak sebelum selesai menurunkan reputasi sedikit.</p>',[{label:'Batal'},{label:'Putus',cls:'bad',fn:()=>endContract(v)}]),
-    balance:()=>Balance.openEditor(),stabt:()=>{R.stabT=v;renderInspect()},bcat:()=>{R.bcat=v;renderPanel()},otab:()=>{R.otab=v;renderPanel()},rcat:()=>{R.rcat=v;renderPanel()},rlog:()=>{const e=(S.rlog||[])[+v];if(e)ratingModal(e)},cartsup:()=>{S.cartSup=v;renderPanel()},cartclear:()=>{S.cart={};renderPanel()},cartrm:()=>{delete S.cart[v];renderPanel()},cartbuy:()=>placeOrder(false),brand:()=>launchBrand(),
+    balance:()=>Balance.openEditor(),upgrade:()=>{const it=itemById(v);if(it)upgradeItem(it)},stabt:()=>{R.stabT=v;renderInspect()},bcat:()=>{R.bcat=v;renderPanel()},otab:()=>{R.otab=v;renderPanel()},rcat:()=>{R.rcat=v;renderPanel()},rlog:()=>{const e=(S.rlog||[])[+v];if(e)ratingModal(e)},cartsup:()=>{S.cartSup=v;renderPanel()},cartclear:()=>{S.cart={};renderPanel()},cartrm:()=>{delete S.cart[v];renderPanel()},cartbuy:()=>placeOrder(false),brand:()=>launchBrand(),
     cart:()=>{const [k,n]=v.split('~');S.cart=S.cart||{};S.cart[k]=(S.cart[k]||0)+(+n);Sfx.play('click');renderPanel()},
     ro:()=>{},skill:()=>skillPick(v),spend:()=>{const [id,k]=v.split('~');spendPoint(id,k)},buysp:()=>buyPoint(v),
     mcat:()=>{R.mcat=v;Sfx.play('click');renderPanel()},
