@@ -454,6 +454,7 @@ const CFG={schemaVersion:19,gameMinPerSec:3,demandBase:.05,startCash:5000000,sta
   rentBase:100000,rentPerLot:120000,autosaveSec:30,lbPushSec:60,speedupGem:2,
   gemRate:250,backendUrl:'',saweriaUser:'',googleClientId:''};
 {const J=window.JL_CONFIG||{};for(const k of ['backendUrl','saweriaUser','googleClientId'])if(typeof J[k]==='string'&&J[k])CFG[k]=J[k].replace(/\/$/,'')}
+const GAME_VERSION='1.1.0'; // versi rilis game; naikkan saat ada perubahan yang terlihat pemain
 const HOSTED=()=>!!(CFG.backendUrl&&CFG.googleClientId); // versi host sendiri: wajib login Google
 const ITEMS={
   counter:{name:'Meja Kasir',cat:'stasiun',kind:'counter',tier:0,draw:'counter',price:0,lvl:1,max:1,desc:'Tempat pelanggan menaruh dan mengambil cucian.'},
@@ -3803,12 +3804,13 @@ function helpModal(){openModal('Cara bermain',`<ol class="ol">
   <li>Misi harian, mingguan, dan bulanan ada di panel kanan; reset mengikuti kalender.</li>
   <li>Esc = tutup panel, R = putar barang.</li></ol>`,[{label:'Mengerti',cls:'pri'}])}
 function aboutModal(){openModal('Tentang Juragan Laundry',`<div class="dev"><img src="assets/icons/logo.png" alt="" width="56" height="56"><div><b>Juragan Laundry</b><small>Simulasi bisnis laundry Indonesia</small><span>Dikembangkan oleh <b>Anan Bahrul Khoir</b></span></div></div>
+  <p class="note" style="display:flex;gap:4px 12px;flex-wrap:wrap;margin:0 0 10px"><span>Versi game <b>v${esc(GAME_VERSION)}</b></span><span>· Skema simpanan <b>v${CFG.schemaVersion}</b></span><span>· Keseimbangan <b>v${Balance.ver||0}</b></span><span>· ${HOSTED()?'Versi host sendiri':'Versi artifact'}</span></p>
   <h3>Arsitektur</h3><ol class="ol">
   <li><b>Konten</b> (item, layanan, staf, riset, misi, cuaca) adalah data, siap dipindah ke Remote Config.</li>
   <li><b>Simulasi</b> berjalan sebagai tick deterministik tanpa DOM, siap dipindah ke server otoritatif.</li>
   <li><b>Layanan</b> adalah adapter: database artifact hari ini, backend sendiri lewat <code>CFG.backendUrl</code> nanti.</li>
-  <li><b>Top-up Saweria</b>: webhook → Worker → tabel credits → game menarik & mengonfirmasi; idempoten per ID transaksi.</li>
-  <li><b>Save</b> memakai skema versi (v${CFG.schemaVersion}) dengan migrasi berurutan.</li></ol>`,[{label:'Tutup'}])}
+  <li><b>Top-up Saweria</b>: webhook → Worker → credits → game mengonfirmasi; diamond dicetak di server, idempoten per ID transaksi.</li>
+  <li><b>Save</b> memakai skema versi (v${CFG.schemaVersion}) dengan migrasi berurutan; saldo & skor diverifikasi Worker.</li></ol>`,[{label:'Tutup'}])}
 async function adminModal(){
   const log=await Admin.log();
   openModal('Konsol pengelola',`
