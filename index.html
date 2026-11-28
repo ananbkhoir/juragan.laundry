@@ -1083,7 +1083,7 @@ const withTimeout=(p,ms)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>re
 /* --- suara: disintesis WebAudio, tanpa file aset --- */
 const Sfx={ctx:null,master:null,on:true,vol:.6,mOn:true,mVol:.35,music:null,mGain:null,mState:'idle',last:{},rainNode:null,rainGain:null,samples:{},sState:'idle',
   init(){try{const p=JSON.parse(Local.get('jl.prefs')||'{}');if(p.sound===false)this.on=false;if(typeof p.vol==='number')this.vol=p.vol;if(p.music===false)this.mOn=false;if(typeof p.mvol==='number')this.mVol=p.mvol}catch(e){}},
-  save(){const p=JSON.parse(Local.get('jl.prefs')||'{}');p.sound=this.on;p.vol=this.vol;p.music=this.mOn;p.mvol=this.mVol;Local.set('jl.prefs',JSON.stringify(p))},
+  save(){const p=prefs();p.sound=this.on;p.vol=this.vol;p.music=this.mOn;p.mvol=this.mVol;Local.set('jl.prefs',JSON.stringify(p))},
   async startMusic(){ // musik latar berulang; jalur volumenya terpisah dari efek suara
     if(!this.ctx||!this.mOn||this.music||this.mState==='loading')return;
     try{if(!this.musicBuf){this.mState='loading';const r=await fetch('audio/music.mp3');if(!r.ok)throw 0;this.musicBuf=await this.ctx.decodeAudioData(await r.arrayBuffer());this.mState='ok'}
@@ -1274,28 +1274,74 @@ const MIGRATIONS={
 function migrate(s){let guard=0;while((s.v||1)<CFG.schemaVersion&&guard++<20){const f=MIGRATIONS[s.v||1];if(!f)break;s=f(s)}return s}
 const strip=(k,v)=>(typeof k==='string'&&k[0]==='_')?undefined:v;
 
-const Saves={status:'idle',lastAt:0,writing:false,pending:false,dirty:false,
+const Saves={status:'idle',lastAt:0,writing:false,pending:false,dirty:false,retryT:null,tries:0,
   key(){return 'jl.save.'+Auth.account.id},
   ref(){if(!Auth.online())return null;try{return Platform.db.collection('data/users/'+Auth.account.id).doc('save')}catch(e){return null}},
   async load(){
-    let local=null,cloud=null;
+    let local=null,cloud=null,ws=null;
     try{const t=Local.get(this.key());if(t)local=JSON.parse(t)}catch(e){}
     const ref=this.ref();
-    if(Auth.google()&&Api.token){try{const j=await Api.get('/api/save');if(j&&typeof j.blob==='string')cloud=JSON.parse(j.blob);this.setStatus('cloud')}catch(e){this.setStatus('error')}}
+    if(Auth.google()&&Api.token){try{const j=await Api.get('/api/save');if(j&&typeof j.blob==='string')cloud=JSON.parse(j.blob);ws=j&&j.wallet;this.setStatus('cloud')}catch(e){this.setStatus('error')}}
     else if(ref){try{const snap=await withTimeout(ref.get(),10000);if(snap.exists){const d=snap.data();if(d&&typeof d.blob==='string')cloud=JSON.parse(d.blob)}this.setStatus('cloud')}catch(e){this.setStatus('error')}}
     let s=local;if(cloud&&(!local||(cloud.savedAt||0)>=(local.savedAt||0)))s=cloud;
-    return s?migrate(s):null;
+    s=s?migrate(s):null;
+    if(s&&ws){s.wallet={coin:Math.round(ws.coin)||0,gem:Math.round(ws.gem)||0};s.walletSeq=ws.seq||0;s.walletVer=ws.version||0;s._wsync={...s.wallet}}
+    return s;
   },
-  async save(){if(R.visit)return;
-    if(!S)return;
+  async save(){if(R.visit||!S)return;
     S.savedAt=Date.now();const blob=JSON.stringify(S,strip);
-    Local.set(this.key(),blob);this.dirty=false;
-    const ref=this.ref(),g=Auth.google()&&!!Api.token;if(!ref&&!g){this.setStatus('local');return}
-    if(this.writing){this.pending=true;return}
+    Local.set(this.key(),blob);
+    const ref=this.ref(),g=Auth.google()&&!!Api.token;
+    if(!ref&&!g){this.dirty=false;this.setStatus('local');return}
+    if(this.writing){this.pending=true;this.dirty=true;return}
     this.writing=true;this.setStatus('saving');
-    try{if(g)await Api.put('/api/save',{blob,savedAt:S.savedAt,v:S.v});else await ref.set({v:S.v,savedAt:S.savedAt,blob});this.lastAt=Date.now();this.setStatus('cloud')}
-    catch(e){this.setStatus(e&&e.status===409?'conflict':'error')}
-    this.writing=false;if(this.pending){this.pending=false;this.save()}
+    let ok=false,conflict=false;
+    try{
+      if(g){
+        // Dompet server sumber kebenaran: kirim usulan perubahan, lalu pakai saldo hasilnya.
+        const seq=(S.walletSeq||0)+1;
+        let w=null;
+        try{w=await Api.post('/api/wallet/sync',{coin:Math.round(S.wallet.coin)||0,gem:Math.round(S.wallet.gem)||0,seq,ver:S.walletVer||0})}
+        catch(err){if(err&&err.status===409)w=await Api.get('/api/wallet');else throw err}
+        if(w&&w.wallet){
+          S.wallet.coin=Math.round(w.wallet.coin)||0;S.wallet.gem=Math.round(w.wallet.gem)||0;
+          S.walletSeq=w.wallet.seq||0;S.walletVer=w.wallet.version||0;S._wsync={...S.wallet};
+          Local.set(this.key(),JSON.stringify(S,strip));
+        }
+        await Api.put('/api/save',{blob:JSON.stringify(S,strip),savedAt:S.savedAt,v:S.v});
+      }
+      else await ref.set({v:S.v,savedAt:S.savedAt,blob});
+      ok=true;
+    }catch(e){conflict=!!(e&&e.status===409);this.setStatus(conflict?'conflict':'error')}
+    this.writing=false;
+    if(ok){this.dirty=false;this.tries=0;this.lastAt=Date.now();if(this.retryT){clearTimeout(this.retryT);this.retryT=null}this.setStatus('cloud')}
+    else{this.dirty=true;this.scheduleRetry(conflict)}
+    if(this.pending){this.pending=false;this.save()}
+  },
+  scheduleRetry(conflict){
+    if(this.retryT)return;
+    const wait=Math.min(30000,1000*Math.pow(1.8,Math.min(this.tries++,6)));
+    this.retryT=setTimeout(async()=>{
+      this.retryT=null;
+      if(conflict&&await this.resolveConflict())return;
+      if(this.dirty)this.save();
+    },wait);
+  },
+  async resolveConflict(){
+    if(R.visit||!Auth.google()||!Api.token)return false;
+    try{
+      const j=await Api.get('/api/save');
+      if(j&&typeof j.blob==='string'){
+        const cloud=JSON.parse(j.blob);
+        if((cloud.savedAt||0)>(S.savedAt||0)){
+          loadState(migrate(cloud));this.dirty=false;this.setStatus('conflict');
+          toast('Progres dari perangkat lain lebih baru dan sudah dimuat','bad');return true;
+        }
+        await Api.put('/api/save',{blob:JSON.stringify(S,strip),savedAt:S.savedAt,v:S.v,force:true});
+        this.dirty=false;this.setStatus('cloud');return true;
+      }
+    }catch(e){}
+    return false;
   },
   setStatus(st){this.status=st;Bus.emit('sync')}};
 
@@ -1309,6 +1355,13 @@ const Economy={
   spend(c,n,reason){if(S.wallet[c]<n)return false;return this.apply(c,-n,reason)},
   grant(c,n,reason,key){return this.apply(c,n,reason,key)},
   charge(c,n,reason){return this.apply(c,-n,reason)}};
+// Saldo dari Worker adalah sumber kebenaran. Dipakai setelah sync / top-up / klaim turnamen.
+function adoptWallet(j){
+  if(!j||!j.wallet||!S)return false;
+  S.wallet.coin=Math.round(j.wallet.coin)||0;S.wallet.gem=Math.round(j.wallet.gem)||0;
+  S.walletSeq=j.wallet.seq||0;S.walletVer=j.wallet.version||0;S._wsync={coin:S.wallet.coin,gem:S.wallet.gem};
+  Saves.dirty=true;hudSnap='';syncUI();return true;
+}
 
 /* --- Top-up Saweria: artifact (dicatat pengelola) atau backend sendiri (webhook otomatis) --- */
 /* keseimbangan game: nilai pengganti dari admin, bernomor versi + catatan perubahan */
@@ -1367,16 +1420,27 @@ const Credits={code:'',recent:[],claimed:new Set(),claimRef:null,writing:false,p
     try{await this.claimRef.set({ids:[...this.claimed].slice(-500),updatedAt:Date.now()})}catch(e){}
     this.writing=false;if(this.pending){this.pending=false;this.persist()}}};
 const Backend={
-  async init(){const u=CFG.backendUrl;if(Auth.google()){this.poll();setInterval(()=>this.poll(),15000);return}if(!S.profile.token){S.profile.token=uid()+uid()+uid();Saves.save()}
-    try{await fetch(u+'/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:Credits.code,token:S.profile.token})})}catch(e){}
-    this.poll();setInterval(()=>this.poll(),15000)},
-  async poll(){try{let j;
-    if(Auth.google()){if(!Api.token)return;j=await Api.get('/api/credits')}
-    else{const r=await fetch(`${CFG.backendUrl}/api/credits?player=${encodeURIComponent(Credits.code)}`,{headers:{'X-Player-Token':S.profile.token}});if(!r.ok)return;j=await r.json()}
-    const ids=[];
-    for(const c of j.credits||[]){Credits.recent.unshift({id:c.id,type:c.type,amount:c.amount,createdAt:c.created_at});applyCredit(c);ids.push(c.id)}
-    if(ids.length&&Auth.google()){await Api.post('/api/credits/ack',{ids});renderPanel('topup')}
-    else if(ids.length){await fetch(CFG.backendUrl+'/api/credits/ack',{method:'POST',headers:{'Content-Type':'application/json','X-Player-Token':S.profile.token},body:JSON.stringify({ids})});renderPanel('topup')}
+  // Top-up hanya lewat sesi Google. Jalur X-Player-Token lama sudah dihapus di Worker.
+  async init(){if(!Auth.google()||!Api.token)return;this.poll();setInterval(()=>this.poll(),15000)},
+  async poll(){try{
+    if(!Api.token)return;
+    const j=await Api.get('/api/credits');const ids=[],donated=[];
+    for(const c of j.credits||[]){
+      Credits.recent.unshift({id:c.id,type:c.type,amount:c.amount,createdAt:c.created_at});ids.push(c.id);
+      // Donasi hanya memengaruhi angka pendukung (bukan saldo); diamond dikirim dari server.
+      if(c.type==='donasi'&&!S.txKeys['cr:'+c.id]){S.txKeys['cr:'+c.id]=Date.now();S.supporter.total+=c.amount;S.supporter.count++;
+        S.ledger.unshift({t:Date.now(),c:'idr',d:c.amount,r:'Donasi via Saweria',day:S.clock.day});donated.push(c.amount);Saves.dirty=true}
+    }
+    if(!ids.length)return;
+    const a=await Api.post('/api/credits/ack',{ids});
+    if(a&&a.wallet)adoptWallet(a);
+    for(const r of (a&&a.rewards)||[]){
+      if(r.starter)S.purchases.starter=r.starterId;
+      if(r.gems)toast(`+${fmt(r.gems)} diamond dari top-up Saweria`,'good');
+    }
+    if(donated.length){toast('Donasimu sudah tercatat. Terima kasih!','good');Supporters.push()}
+    if((a&&a.rewards&&a.rewards.length)||donated.length)Sfx.play('reward');
+    Saves.save();renderPanel('topup');
   }catch(e){}}};
 const Admin={
   async setSaweria(name){await Platform.db.doc('config/store').set({saweria:name,speedAll:!!Shop.cfg.speedAll,updatedAt:Date.now()})},
@@ -1394,9 +1458,11 @@ const Admin={
   async log(){try{const q=await Platform.db.collection('creditlog').orderBy('createdAt','desc').limit(15).get();return q.docs.map(d=>d.data())}catch(e){return[]}}};
 const Leaderboard={rows:[],frows:[],names:{},status:'idle',fstatus:'idle',unsub:null,lastKey:'',pushing:false,myRank:null,total:0,timer:null,
   async push(){if(!Auth.online()||this.pushing||!S||R.visit)return;Tour.push();Visit.push();
-    const body={shop:String(S.profile.shop).slice(0,32),score:Math.round(netWorth()),lvl:S.lvl,rep:Math.round(S.rep*100)/100,done:S.stats.done,day:S.clock.day};
+    // `score` tidak dikirim lagi: Worker menghitungnya dari dompet server + statistik.
+    const body={shop:String(S.profile.shop).slice(0,32),lvl:S.lvl,rep:Math.round(S.rep*100)/100,done:S.stats.done,day:S.clock.day};
     const key=JSON.stringify(body);if(key===this.lastKey)return;this.pushing=true;
-    try{if(Auth.google())await Api.post('/api/leaderboard',body);else await Platform.db.collection('leaderboard').doc(Auth.account.id).set({...body,updatedAt:Date.now()});this.lastKey=key}catch(e){}
+    try{if(Auth.google()){const r=await Api.post('/api/leaderboard',body);if(r&&typeof r.score==='number')this.myScore=r.score}
+      else await Platform.db.collection('leaderboard').doc(Auth.account.id).set({...body,score:Math.round(netWorth()),updatedAt:Date.now()});this.lastKey=key}catch(e){}
     this.pushing=false},
   async fetchHosted(){ // versi Google: ambil peringkat global & teman dari server
     const sort=R.lbSort||'score';
@@ -1452,8 +1518,22 @@ const Tour={rows:[],frows:[],status:'idle',myRank:null,total:0,prevBusy:false,la
     this.claimCheck();renderPanel('peringkat')},
   async claimCheck(){const p=S.tourPrev;if(!p||p.claimed||this.prevBusy||!Auth.online())return;this.prevBusy=true;
     try{const r=await this.rowsFor(p.wk,'global');const rank=r.myRank||(r.rows.length+1),gems=tourPrize(rank,p.score);p.rank=rank;
+      const claim=async()=>{
+        try{
+          if(Auth.google()){
+            const a=await Api.post('/api/tour/claim',{wk:p.wk});
+            if(a&&a.wallet)adoptWallet(a);
+            p.rank=a.rank||rank;p.claimed=true;
+            toast(a.prize?`+${a.prize} diamond hadiah turnamen`:'Hadiah sudah diambil',a.prize?'good':'bad');
+          }else{
+            Economy.grant('gem',gems,`Hadiah turnamen ${p.wk} (peringkat ${rank})`,'tour'+p.wk);p.claimed=true;
+            toast(`+${gems} diamond hadiah turnamen`,'good');
+          }
+          Sfx.play('reward');Saves.save();renderPanel();
+        }catch(e){toast('Hadiah belum bisa diambil. Coba lagi nanti.','bad')}
+      };
       openModal('Hasil turnamen minggu lalu',`<p>Turnamen <b>${esc(tourKind(p.wk).name)}</b> (${esc(p.wk)}) sudah selesai.</p><p>Skormu <b>${esc(tourKind(p.wk).fmt(p.score))}</b> — peringkat <b>#${rank}</b> dari ${Math.max(rank,r.total)} laundry.</p>`,
-        [{label:`Ambil ${gems} diamond`,cls:'pri',fn:()=>{Economy.grant('gem',gems,`Hadiah turnamen ${p.wk} (peringkat ${rank})`,'tour'+p.wk);p.claimed=true;Sfx.play('reward');Saves.save();renderPanel()}}])}catch(e){}this.prevBusy=false}};
+        [{label:Auth.google()?'Ambil hadiah':`Ambil ${gems} diamond`,cls:'pri',fn:claim}])}catch(e){}this.prevBusy=false}};
 function tourHTML(){const t=tourCheck(),K=tourKind(t.wk),sc=tourScore(t);if(Tour.status==='idle')Tour.fetch();
   const left=Math.max(0,resetAt('w')-Date.now()),d=Math.floor(left/864e5),h=Math.floor(left%864e5/36e5);
   const rows=(R.tourScope==='friends'?Tour.frows:Tour.rows),me=Auth.online()&&Auth.account.id;
@@ -1522,7 +1602,7 @@ const DIRS=[[1,0],[0,1],[-1,0],[0,-1]];
 
 function newState(shop){
   const s={v:CFG.schemaVersion,createdAt:Date.now(),savedAt:0,
-    profile:{shop:shop||'Laundry Kilat'},wallet:{coin:CFG.startCash,gem:CFG.startGem},ledger:[],txKeys:{},
+    profile:{shop:shop||'Laundry Kilat'},wallet:{coin:CFG.startCash,gem:CFG.startGem},walletSeq:0,walletVer:0,ledger:[],txKeys:{},
     lvl:1,xp:0,lot:0,hours:{...CFG.defaultHours},hoursNext:null,
     clock:{day:1,min:CFG.defaultHours.open*60,run:0,closed:false},speed:1,
     items:[],staff:[],orders:[],nextNo:1,
@@ -3687,7 +3767,7 @@ function renderMissions(force){
   if(force||el._last!==html){el._last=html;el.innerHTML=html}
 }
 function setMisOpen(open,user=true){$('#mis').classList.toggle('closed',!open);$('#misBody').hidden=!open;$('#misToggle').setAttribute('aria-expanded',String(open));$('#misChev').textContent=open?'▾':'▸';
-  const p=JSON.parse(Local.get('jl.prefs')||'{}');if(user){p.mis=open;Local.set('jl.prefs',JSON.stringify(p))}if(open)renderMissions(true)}
+  const p=prefs();if(user){p.mis=open;Local.set('jl.prefs',JSON.stringify(p))}if(open)renderMissions(true)}
 
 /* --- menu hamburger --- */
 function menuHTML(){
@@ -3826,8 +3906,9 @@ async function copyText(t,msg){try{await navigator.clipboard.writeText(t);toast(
 const prefs=()=>{try{return JSON.parse(Local.get('jl.prefs')||'{}')}catch(e){return{}}};
 function setPref(k,v){const p=prefs();p[k]=v;Local.set('jl.prefs',JSON.stringify(p))}
 function speedAllowed(){return (Auth.isOwner&&!!prefs().showSpeed)||!!Shop.cfg.speedAll}
-function applySpeedUI(){const ok=speedAllowed();document.querySelector('.speed').hidden=!ok;if(!ok&&S&&S.speed!==1)setSpeed(1)}
-function setSpeed(m){S.speed=m;document.querySelectorAll('[data-sp]').forEach(b=>b.classList.toggle('on',+b.dataset.sp===m))}
+function applySpeedUI(){const ok=speedAllowed();document.querySelector('.speed').hidden=!ok;
+  if(!ok&&S&&S.speed!==1){S.speed=1;document.querySelectorAll('[data-sp]').forEach(b=>b.classList.toggle('on',+b.dataset.sp===1))}}
+function setSpeed(m){if(!speedAllowed()&&+m!==1)return;S.speed=m;document.querySelectorAll('[data-sp]').forEach(b=>b.classList.toggle('on',+b.dataset.sp===m))}
 document.addEventListener('change',e=>{const a=e.target.dataset&&e.target.dataset.act;if(!a)return;if(a.startsWith('offday:'))setShift(a.slice(7),e.target.value);
   if(a.startsWith('rcp:')){const [k,c]=a.slice(4).split('~');recipeFor(k)[c]=e.target.value||null;Saves.dirty=true;renderPanel()}
   if(a.startsWith('ro:')){const k=a.slice(3);S.reorder=S.reorder||{};const liq=isLiquid(k);S.reorder[k]={on:e.target.checked,min:liq?CHEM[k].dose*40:20,qty:liq?(CHEM[k].dose>=10?10000:5000):200,sup:S.cartSup==='kelontong'&&!supOk('kelontong',k)?'agen':S.cartSup||'agen'};
@@ -3935,7 +4016,7 @@ function setWallMode(m){R.wallMode=WALLM[m]?m:'full';setPref('wall',R.wallMode);
 function cycleWall(){const k=Object.keys(WALLM),n=k[(k.indexOf(R.wallMode||'full')+1)%k.length];setWallMode(n);toast(WALLM[n].name)}
 $('#zWall').onclick=cycleWall;setWallMode(prefs().wall||'full');
 document.addEventListener('keydown',e=>{if((e.key==='w'||e.key==='W')&&!/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName||'')&&!e.ctrlKey&&!e.metaKey){cycleWall()}});
-const ptrs=new Map();let drag=null,pinch=0;
+const ptrs=new Map();let drag=null,pinch=0,dragPid=null;
 function toTileF(sx,sy){const w=toWorld(sx,sy);return{x:(w.x/HW+w.y/HH)/2,y:(w.y/HH-w.x/HW)/2}}
 function toVertex(sx,sy){const f=toTileF(sx,sy),{w,h}=lotDim();return{x:clamp(Math.round(f.x),0,w),y:clamp(Math.round(f.y),0,h)}}
 function nearestEdge(f){const dh=Math.abs(f.y-Math.round(f.y)),dv=Math.abs(f.x-Math.round(f.x));
@@ -3979,19 +4060,28 @@ function removeEdge(e){const ex=wallAt(e);if(!ex)return false;
   const ref=Math.floor((ex.door?ITEMS.idoor.price:wst(ex).price)*.5);Economy.grant('coin',ref,ex.door?'Membongkar pintu':'Membongkar dinding');
   repathAll();Sfx.play('sell');Saves.dirty=true;toast(ex.door?'Pintu dibongkar':'Segmen dinding dibongkar');return true}
 const edgeMode=()=>R.build==='wall'||R.build==='idoor';
+const releasePtr=id=>{try{if(cv.hasPointerCapture(id))cv.releasePointerCapture(id)}catch(e){}};
 cv.addEventListener('pointerdown',e=>{if(e.button===2)return;cv.setPointerCapture(e.pointerId);
-  if(S&&R.build==='wall'&&e.isPrimary&&ptrs.size===0){const t=toVertex(e.offsetX,e.offsetY);R.wallDrag={a:t,b:t};return}
-  if(S&&R.floorMode&&e.isPrimary&&e.button===0&&ptrs.size===0){const t=toTile(e.offsetX,e.offsetY);R.floorDrag={a:t,b:t};return}ptrs.set(e.pointerId,{x:e.offsetX,y:e.offsetY});drag={x:e.offsetX,y:e.offsetY,cx:cam.x,cy:cam.y,moved:false};
+  if(S&&R.build==='wall'&&e.isPrimary&&ptrs.size===0){const t=toVertex(e.offsetX,e.offsetY);R.wallDrag={a:t,b:t};dragPid=e.pointerId;return}
+  if(S&&R.floorMode&&e.isPrimary&&e.button===0&&ptrs.size===0){const t=toTile(e.offsetX,e.offsetY);R.floorDrag={a:t,b:t};dragPid=e.pointerId;return}
+  ptrs.set(e.pointerId,{x:e.offsetX,y:e.offsetY});drag={x:e.offsetX,y:e.offsetY,cx:cam.x,cy:cam.y,moved:false};
   if(ptrs.size===2){const [a,b]=[...ptrs.values()];pinch=Math.hypot(a.x-b.x,a.y-b.y)}});
 cv.addEventListener('pointermove',e=>{
   if(S){R.hover=toTile(e.offsetX,e.offsetY);R.hoverF=toTileF(e.offsetX,e.offsetY)}
-  if(R.wallDrag){R.wallDrag.b=toVertex(e.offsetX,e.offsetY);return}
-  if(R.floorDrag){R.floorDrag.b=toTile(e.offsetX,e.offsetY);return}
+  if(R.wallDrag){if(e.pointerId===dragPid)R.wallDrag.b=toVertex(e.offsetX,e.offsetY);return}
+  if(R.floorDrag){if(e.pointerId===dragPid)R.floorDrag.b=toTile(e.offsetX,e.offsetY);return}
   if(!ptrs.has(e.pointerId))return;ptrs.set(e.pointerId,{x:e.offsetX,y:e.offsetY});
   if(ptrs.size===2){const [a,b]=[...ptrs.values()];const d=Math.hypot(a.x-b.x,a.y-b.y);if(pinch)cam.z=clamp(cam.z*d/pinch,.35,2.4);pinch=d;drag.moved=true;R.userCam=true;return}
   if(drag){const dx=e.offsetX-drag.x,dy=e.offsetY-drag.y;if(Math.hypot(dx,dy)>6)drag.moved=true;if(drag.moved){R.userCam=true;cam.x=drag.cx-dx/cam.z;cam.y=drag.cy-dy/cam.z}}});
-cv.addEventListener('pointerup',e=>{if(R.floorDrag){R.floorDrag.b=toTile(e.offsetX,e.offsetY);paintFloor();return}if(R.wallDrag){R.wallDrag.b=toVertex(e.offsetX,e.offsetY);placeWallLine();R.wallDrag=null;return}if(!ptrs.has(e.pointerId))return;const wasDrag=drag&&drag.moved;ptrs.delete(e.pointerId);if(ptrs.size<2)pinch=0;if(ptrs.size)return;drag=null;if(!wasDrag&&S)clickAt(e.offsetX,e.offsetY)});
-cv.addEventListener('pointercancel',e=>{R.wallDrag=null;ptrs.delete(e.pointerId);drag=null;pinch=0});
+const endDrag=(e,commit)=>{
+  if(!R.wallDrag&&!R.floorDrag)return false;
+  if(e.pointerId!==dragPid)return true;
+  if(R.floorDrag){R.floorDrag.b=toTile(e.offsetX,e.offsetY);if(commit)paintFloor();R.floorDrag=null}
+  else{R.wallDrag.b=toVertex(e.offsetX,e.offsetY);if(commit)placeWallLine();R.wallDrag=null}
+  dragPid=null;ptrs.delete(e.pointerId);releasePtr(e.pointerId);return true;
+};
+cv.addEventListener('pointerup',e=>{if(endDrag(e,true))return;if(!ptrs.has(e.pointerId))return;const wasDrag=drag&&drag.moved;ptrs.delete(e.pointerId);releasePtr(e.pointerId);if(ptrs.size<2)pinch=0;if(ptrs.size)return;drag=null;if(!wasDrag&&S)clickAt(e.offsetX,e.offsetY)});
+cv.addEventListener('pointercancel',e=>{if(e.pointerId===dragPid){R.wallDrag=null;R.floorDrag=null;dragPid=null}ptrs.delete(e.pointerId);releasePtr(e.pointerId);drag=null;pinch=0});
 cv.addEventListener('pointerleave',()=>{R.hover=null;R.hoverF=null});
 cv.addEventListener('wheel',e=>{e.preventDefault();R.userCam=true;const before=toWorld(e.offsetX,e.offsetY);cam.z=clamp(cam.z*(e.deltaY<0?1.1:1/1.1),.35,2.4);const after=toWorld(e.offsetX,e.offsetY);cam.x+=before.x-after.x;cam.y+=before.y-after.y},{passive:false});
 cv.addEventListener('contextmenu',e=>{e.preventDefault();if(R.build||R.move||R.sell)cancelPlacing();else if(R.sel){R.sel=null;renderInspect()}});
@@ -4097,7 +4187,7 @@ function offlineCheck(){
 }
 async function boot(){
   resize();syncSnd();
-  const pr=JSON.parse(Local.get('jl.prefs')||'{}');R.bubbles=pr.bubbles!==false;R.nameTags=pr.nameTags!==false;R.showZones=pr.showZones!==false;setMisOpen(pr.mis!=null?pr.mis:window.innerWidth>700,false);
+  const pr=prefs();R.bubbles=pr.bubbles!==false;R.nameTags=pr.nameTags!==false;R.showZones=pr.showZones!==false;setMisOpen(pr.mis!=null?pr.mis:window.innerWidth>700,false);
   await Platform.init();await Auth.init();syncUI();await Balance.load();
   const s=await Saves.load();
   $('#loading').remove();

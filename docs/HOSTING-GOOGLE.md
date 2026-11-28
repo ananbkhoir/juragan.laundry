@@ -15,7 +15,7 @@ Pemain ──(tombol Google)──► Google memberi ID token
    └──POST /api/auth/google──► Worker Cloudflare ── cek tanda tangan token dengan kunci publik Google
                                    │              ── buat akun + ID Pemain, beri token sesi 30 hari
                                    ▼
-                               D1: users, sessions, saves, leaderboard, friends, credits
+                               D1: users, sessions, saves, leaderboard, friends, credits, wallets, wallet_ops
 ```
 
 Yang kamu butuhkan: akun Google, akun Cloudflare gratis, dan Node.js untuk menjalankan `wrangler`.
@@ -45,21 +45,24 @@ cd saweria-backend
 npm install -g wrangler && wrangler login           # sekali saja
 wrangler d1 create juragan-laundry                   # lewati kalau sudah ada; salin database_id ke wrangler.toml
 wrangler d1 execute juragan-laundry --remote --file=schema.sql
+# Kalau database sudah dipakai sebelum Fase 1, jalankan migrasi dompet:
+wrangler d1 execute juragan-laundry --remote --file=migrate-fase1.sql
 ```
 
 Ubah `wrangler.toml`:
 
 ```toml
 [vars]
-ALLOWED_ORIGIN = "https://juragan-laundry.pages.dev"          # alamat game; boleh beberapa, pisahkan koma
+ALLOWED_ORIGIN = "https://juragan-laundry.pages.dev"          # HANYA origin produksi; localhost ada di [env.dev]
 GOOGLE_CLIENT_ID = "1234567890-xxxx.apps.googleusercontent.com"
 ```
 
-Simpan rahasia Saweria kalau belum, lalu deploy:
+Simpan rahasia (webhook gagal 500 bila stream key tidak terpasang), lalu deploy:
 
 ```bash
 wrangler secret put SAWERIA_STREAM_KEY
 wrangler secret put ADMIN_KEY
+wrangler secret put ADMIN_SUBS        # sub Google admin (utama); fallback: ADMIN_EMAILS
 wrangler deploy
 ```
 
@@ -102,7 +105,7 @@ wrangler pages deploy dist --project-name juragan-laundry
 - **Pindah progres dari link artifact.** Di link artifact, buka menu ☰ → **Simpan & cadangan → Salin kode cadangan**. Di versi Google, pilih **Pulihkan dari cadangan** lalu tempel kodenya.
 - **ID Pemain di versi Google berbeda** dari ID di artifact, karena terikat ke akun Google. Untuk top-up Saweria, pemain menulis ID yang tampil di game versi Google.
 - **Keluar** ada di menu ☰ → **Akun & profil** dan di tab **Akun**.
-- **Keamanan peringkat.** Skor masih dilaporkan oleh perangkat pemain. Server membatasi nilai yang masuk akal, tapi pemain yang mengutak-atik peramban masih bisa memalsukan skor. Untuk rilis kompetitif, perhitungan skor perlu dipindah ke server.
+- **Keamanan peringkat & saldo (Fase 1).** Skor dihitung Worker dari dompet server + statistik; field `score` yang dikirim game diabaikan. Saldo tidak dipercaya dari blob simpanan — Worker selalu menimpanya dengan nilai server. Klien hanya mengusulkan perubahan lewat `/api/wallet/sync` dengan `seq` naik 1; duplikat diabaikan dan loncatan ditolak. Field `ver` memberi tahu server versi dompet terakhir yang dilihat klien; bila tertinggal, penurunan saldo diabaikan supaya top-up yang belum di-ack tidak hilang. Kenaikan dibatasi ±24 jam terakhir (maks. Rp5 juta dan 200 diamond per jam), sedangkan penurunan tidak boleh melebihi saldo. Top-up dan hadiah turnamen dicetak server dengan kunci idempotensi.
 - **Privasi.** Yang disimpan hanya ID Google (`sub`), nama, nama depan, foto, dan email. Di peringkat hanya nama depan dan nama laundry yang tampil; email tidak pernah dikirim ke pemain lain.
 
 ## Endpoint baru di Worker
@@ -113,21 +116,25 @@ wrangler pages deploy dist --project-name juragan-laundry
 | GET | `/api/me` | profil pemain dari token sesi |
 | POST | `/api/logout` | hapus sesi |
 | GET/PUT | `/api/save` | simpanan cloud; menolak (409) simpanan yang lebih lama dari yang ada di server |
-| POST | `/api/leaderboard` | kirim skor sendiri |
+| GET | `/api/wallet` | saldo server + 30 mutasi terakhir |
+| POST | `/api/wallet/sync` | `{coin, gem, seq, ver}` → sinkron usulan dompet; `ver` harus versi terakhir yang dilihat klien, skor tidak dikirim lagi |
+| POST | `/api/leaderboard` | kirim `shop`, `lvl`, `rep`, `done`, `day`; Worker yang menghitung `score` |
 | GET | `/api/leaderboard?scope=global\|friends&sort=score\|rep\|done` | papan peringkat |
 | GET | `/api/friends` | teman, permintaan masuk, permintaan keluar |
 | POST | `/api/friends/request` | `{code}`; otomatis berteman kalau orang itu sudah mengajak duluan |
 | POST | `/api/friends/respond` | `{code, accept}` |
 | POST | `/api/friends/remove` | `{code}` |
 | GET | `/api/credits` | dengan token sesi: top-up milik akun ini |
+| POST | `/api/credits/ack` | `{ids}` → hadiah dicetak server; mengembalikan `{acked, rewards, wallet}` |
+| POST | `/api/tour/claim` | `{wk}` → hadiah turnamen dari peringkat server, sekali per minggu |
 
 Semua endpoint pemain memakai header `Authorization: Bearer <token sesi>`.
 
 ## Halaman admin (`admin.html`)
 
-Halaman admin terpisah dari game dan hanya bisa dibuka oleh akun Google yang emailnya terdaftar di backend.
+Halaman admin terpisah dari game dan hanya bisa dibuka oleh akun Google yang emailnya **terverifikasi** dan terdaftar di backend (berdasarkan `sub` Google).
 
-1. Isi `ADMIN_EMAILS` di `saweria-backend/wrangler.toml`, pisahkan dengan koma. Contoh: `ADMIN_EMAILS = "kamu@gmail.com"`.
+1. Pasang secret `ADMIN_SUBS` berisi sub Google admin (pisahkan koma). Untuk kompatibilitas, `ADMIN_EMAILS` masih diterima, tetapi tidak lagi ditaruh di `wrangler.toml` — gunakan `wrangler secret put ADMIN_EMAILS`. Contoh: `wrangler secret put ADMIN_SUBS` lalu isi `1234567890,0987654321`.
 2. Jalankan ulang `schema.sql` (lokal: `--local`, produksi: `--remote`) agar tabel `balance` dibuat. Perintahnya aman diulang.
 3. Buka `http://localhost:8000/admin.html` (atau `https://alamat-game-mu/admin.html`) lalu masuk dengan Google.
 

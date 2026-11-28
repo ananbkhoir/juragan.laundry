@@ -2,12 +2,26 @@ name = "juragan-laundry-api"
 main = "src/worker.js"
 compatibility_date = "2026-11-01"
 
+# Deploy default = PRODUKSI. Hanya origin publik yang diizinkan.
+# SAWERIA_STREAM_KEY, ADMIN_KEY, dan ADMIN_SUBS/ADMIN_EMAILS wajib disetel sebagai
+# secret: wrangler secret put <nama>  (jangan ditaruh di file ini).
 [vars]
-ALLOWED_ORIGIN = "https://juraganlaundry.vercel.app,http://localhost:8000,http://127.0.0.1:8000"   # alamat game-mu; boleh beberapa, pisahkan koma
-ADMIN_EMAILS = "ananbkhoir@gmail.com,anan.lemhannas.2025@gmail.com"   # email Google admin untuk admin.html
-GOOGLE_CLIENT_ID = "992175212524-ac4q6js15a0t6o40gnrgrfpe3fj89grm.apps.googleusercontent.com"   # OAuth Client ID (Web) dari Google Cloud Console
+ALLOWED_ORIGIN = "https://juraganlaundry.vercel.app"
+GOOGLE_CLIENT_ID = "992175212524-ac4q6js15a0t6o40gnrgrfpe3fj89grm.apps.googleusercontent.com"
 
 [[d1_databases]]
+binding = "DB"
+database_name = "juragan-laundry"
+database_id = "095fbdf8-e406-45c6-8673-cda7372bc70a"
+
+# Deploy pengembangan: wrangler dev --env dev
+# Secret untuk env ini perlu dipasang terpisah: wrangler secret put <nama> --env dev
+[env.dev]
+[env.dev.vars]
+ALLOWED_ORIGIN = "http://localhost:8000,http://127.0.0.1:8000"
+GOOGLE_CLIENT_ID = "992175212524-ac4q6js15a0t6o40gnrgrfpe3fj89grm.apps.googleusercontent.com"
+
+[[env.dev.d1_databases]]
 binding = "DB"
 database_name = "juragan-laundry"
 database_id = "095fbdf8-e406-45c6-8673-cda7372bc70a"

@@ -13,16 +13,62 @@
  *   Sesi dipakai untuk simpanan cloud, papan peringkat global & teman, dan top-up.
  *
  * Secrets (wrangler secret put ...):
- *   SAWERIA_STREAM_KEY  stream key dari dashboard Saweria
+ *   SAWERIA_STREAM_KEY  wajib. Stream key dari dashboard Saweria (webhook fail-closed jika kosong)
  *   ADMIN_KEY           kunci acak panjang untuk endpoint /api/admin/*
+ *   ADMIN_SUBS          sub Google admin (prioritas), pisahkan koma; fallback: ADMIN_EMAILS
  * Vars (wrangler.toml):
- *   ALLOWED_ORIGIN      origin game, mis. https://juragan-laundry.pages.dev (boleh beberapa, pisahkan koma)
+ *   ALLOWED_ORIGIN      origin game produksi; origin localhost ada di [env.dev]
  *   GOOGLE_CLIENT_ID    OAuth Client ID (Web) dari Google Cloud Console
- *   ADMIN_EMAILS        email Google admin, pisahkan koma (halaman admin.html: keseimbangan & top-up)
+ * Catatan: endpoint lama /api/register + X-Player-Token sudah dihapus; top-up hanya lewat sesi Google.
  */
 
 const CODE_RE = /JL-[A-HJ-NP-Z2-9]{6}/i;
 const HMAC_KEYS = ['version', 'id', 'amount_raw', 'donator_name', 'donator_email'];
+
+/* ---------- aturan dompet: sumber kebenaran ada di sini, bukan di klien ---------- */
+const GEM_PACKS = [
+  { gems: 60, bonus: 0, price: 15000 }, { gems: 160, bonus: 12, price: 39000 },
+  { gems: 420, bonus: 40, price: 99000 }, { gems: 1000, bonus: 150, price: 229000 },
+];
+const STARTER = { gems: 100, cash: 3000000, price: 29000 };
+const MAX_COIN = 1e13, MAX_GEM = 1e8;
+const rp = (n) => 'Rp' + Math.round(num(n, 0, MAX_COIN)).toLocaleString('id-ID');
+function rewardFor(amount, gemRate = 250) {
+  const p = GEM_PACKS.find((x) => x.price === amount);
+  if (p) return { gems: p.gems + p.bonus, label: `Paket ${p.gems + p.bonus} diamond` };
+  if (amount === STARTER.price) return { gems: STARTER.gems, cash: STARTER.cash, starter: true, label: 'Paket Pemula' };
+  return { gems: Math.floor(amount / gemRate), label: `Kurs ${rp(gemRate)} per diamond` };
+}
+async function walletFor(env, uid) {
+  let w = await env.DB.prepare('SELECT * FROM wallets WHERE user_id = ?1').bind(uid).first();
+  if (!w) {
+    const vals = (await getBalance(env)).values;
+    const coin = Math.round(num(vals.startCash ?? 5000000, 0, MAX_COIN));
+    const gem = Math.round(num(vals.startGem ?? 20, 0, MAX_GEM));
+    await env.DB.prepare('INSERT OR IGNORE INTO wallets (user_id, coin, gem, version, seq, updated_at) VALUES (?1,?2,?3,0,0,?4)')
+      .bind(uid, coin, gem, Date.now()).run();
+    w = await env.DB.prepare('SELECT * FROM wallets WHERE user_id = ?1').bind(uid).first();
+  }
+  return w;
+}
+const walletView = (w) => ({ coin: w.coin, gem: w.gem, version: w.version, seq: w.seq });
+async function mint(env, uid, cur, amount, reason, idem) {
+  if (!['coin', 'gem'].includes(cur)) throw httpErr(400, 'invalid_currency');
+  const n = Math.round(num(amount, 0, cur === 'coin' ? MAX_COIN : MAX_GEM));
+  if (n <= 0) return false;
+  const w = await walletFor(env, uid), now = Date.now();
+  const key = String(idem).slice(0, 120);
+  // UPDATE dulu dengan syarat idem belum dipakai, baru catat idemnya. Kalau dibalik,
+  // INSERT OR IGNORE gagal tapi UPDATE tetap menambah saldo saat repeat.
+  const add = env.DB.prepare(`UPDATE wallets SET ${cur} = MIN(?, ${cur} + ?), version = version + 1, updated_at = ?
+    WHERE user_id = ? AND NOT EXISTS (SELECT 1 FROM wallet_ops WHERE idem = ? AND user_id = ?)`)
+    .bind(cur === 'coin' ? MAX_COIN : MAX_GEM, n, now, uid, key, uid);
+  const mark = env.DB.prepare('INSERT OR IGNORE INTO wallet_ops (idem, user_id, cur, delta, reason, version, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)')
+    .bind(key, uid, cur, n, String(reason).slice(0, 120), w.version + 1, now);
+  // batch = transaksi: kalau salah satu gagal, saldo tidak berubah.
+  const rs = await env.DB.batch([add, mark]);
+  return rs[0].meta?.changes > 0;
+}
 
 export default {
   async fetch(req, env) {
@@ -31,14 +77,15 @@ export default {
     if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     try {
       if (url.pathname === '/saweria/webhook' && req.method === 'POST') return await webhook(req, env);
-      if (url.pathname === '/api/register' && req.method === 'POST') return json(await register(req, env), cors);
-      if (url.pathname === '/api/credits' && req.method === 'GET') return json(await listCredits(req, env, url), cors);
+      if (url.pathname === '/api/credits' && req.method === 'GET') return json(await listCredits(req, env), cors);
       if (url.pathname === '/api/credits/ack' && req.method === 'POST') return json(await ack(req, env), cors);
       if (url.pathname === '/api/admin/unmatched' && req.method === 'GET') return json(await unmatched(req, env), cors);
       if (url.pathname === '/api/admin/assign' && req.method === 'POST') return json(await assign(req, env), cors);
       if (url.pathname === '/api/auth/google' && req.method === 'POST') return json(await googleLogin(req, env), cors);
       if (url.pathname === '/api/me' && req.method === 'GET') return json({ user: publicUser(await sessionUser(req, env)) }, cors);
       if (url.pathname === '/api/logout' && req.method === 'POST') return json(await logout(req, env), cors);
+      if (url.pathname === '/api/wallet' && req.method === 'GET') return json(await getWallet(req, env), cors);
+      if (url.pathname === '/api/wallet/sync' && req.method === 'POST') return json(await syncWallet(req, env), cors);
       if (url.pathname === '/api/save' && req.method === 'GET') return json(await getSave(req, env), cors);
       if (url.pathname === '/api/save' && (req.method === 'PUT' || req.method === 'POST')) return json(await putSave(req, env), cors);
       if (url.pathname === '/api/leaderboard' && req.method === 'POST') return json(await submitScore(req, env), cors);
@@ -48,6 +95,7 @@ export default {
       if (url.pathname === '/api/friends/respond' && req.method === 'POST') return json(await friendRespond(req, env), cors);
       if (url.pathname === '/api/friends/remove' && req.method === 'POST') return json(await friendRemove(req, env), cors);
       if (url.pathname === '/api/tour' && req.method === 'POST') return json(await submitTour(req, env), cors);
+      if (url.pathname === '/api/tour/claim' && req.method === 'POST') return json(await claimTour(req, env), cors);
       if (url.pathname === '/api/tour' && req.method === 'GET') return json(await tourBoard(req, env, url), cors);
       if (url.pathname === '/api/layout' && (req.method === 'PUT' || req.method === 'POST')) return json(await putLayout(req, env), cors);
       if (url.pathname === '/api/visit' && req.method === 'GET') return json(await visit(req, env, url), cors);
@@ -70,6 +118,8 @@ async function webhook(req, env) {
   const raw = await req.text();
   let p;
   try { p = JSON.parse(raw); } catch { return new Response('bad json', { status: 400 }); }
+  // Fail-closed: tanpa stream key, HMAC dengan kunci kosong bisa dihitung siapa pun.
+  if (!env.SAWERIA_STREAM_KEY) return new Response('server_misconfigured', { status: 500 });
   const sig = req.headers.get('Saweria-Callback-Signature') || '';
   if (!sig) return new Response('missing signature', { status: 401 });
   const data = HMAC_KEYS.map((k) => p[k] ?? '').join('');
@@ -94,58 +144,57 @@ async function webhook(req, env) {
   return new Response('ok', { status: 200 });
 }
 
-/* ---------- API pemain ---------- */
-async function register(req, env) {
-  const { code, token } = await req.json();
-  if (!CODE_RE.test(code || '') || typeof token !== 'string' || token.length < 20) throw httpErr(400, 'invalid');
-  const hash = await sha256Hex(token);
-  const row = await env.DB.prepare('SELECT token_hash FROM players WHERE code = ?1').bind(code).first();
-  if (row && row.token_hash !== hash) throw httpErr(409, 'code_taken');
-  if (!row) await env.DB.prepare('INSERT INTO players (code, token_hash, created_at) VALUES (?1, ?2, ?3)').bind(code, hash, Date.now()).run();
-  return { ok: true };
-}
-async function auth(req, env, code) {
-  const token = req.headers.get('X-Player-Token') || '';
-  if (!CODE_RE.test(code || '') || !token) throw httpErr(401, 'unauthorized');
-  const row = await env.DB.prepare('SELECT token_hash FROM players WHERE code = ?1').bind(code).first();
-  if (!row || row.token_hash !== (await sha256Hex(token))) throw httpErr(401, 'unauthorized');
-}
-async function codeFromSession(req, env) {
-  if (!(req.headers.get('Authorization') || '').startsWith('Bearer ')) return null;
-  return (await sessionUser(req, env)).code;
-}
-async function listCredits(req, env, url) {
-  let code = await codeFromSession(req, env);
-  if (!code) { code = (url.searchParams.get('player') || '').toUpperCase(); await auth(req, env, code); }
+/* ---------- API pemain: wajib sesi Google (jalur X-Player-Token dihapus) ---------- */
+async function listCredits(req, env) {
+  const u = await sessionUser(req, env);
   const { results } = await env.DB.prepare(
     'SELECT id, type, amount, created_at FROM credits WHERE code = ?1 AND claimed = 0 ORDER BY created_at LIMIT 50'
-  ).bind(code).all();
+  ).bind(u.code).all();
   return { credits: results || [] };
 }
 async function ack(req, env) {
+  const u = await sessionUser(req, env);
   const body = await req.json();
   const ids = Array.isArray(body.ids) ? body.ids.slice(0, 50).map(String) : [];
-  const row = ids.length ? await env.DB.prepare('SELECT code FROM credits WHERE id = ?1').bind(ids[0]).first() : null;
-  if (!row) return { ok: true, acked: 0 };
-  const sc = await codeFromSession(req, env);
-  if (sc) { if (sc !== row.code) throw httpErr(401, 'unauthorized'); } else await auth(req, env, row.code);
+  const now = Date.now(), rewards = [];
   let n = 0;
   for (const id of ids) {
+    const c = await env.DB.prepare('SELECT id, code, type, amount, claimed FROM credits WHERE id = ?1').bind(id).first();
+    if (!c || c.code !== u.code || c.claimed) continue;
     const r = await env.DB.prepare('UPDATE credits SET claimed = 1, claimed_at = ?1 WHERE id = ?2 AND code = ?3 AND claimed = 0')
-      .bind(Date.now(), id, row.code).run();
-    n += r.meta?.changes || 0;
+      .bind(now, id, u.code).run();
+    if (!(r.meta?.changes)) continue;
+    n++;
+    if (c.type === 'donasi') continue;
+    // Hadiah dihitung SERVER, bukan dari angka yang dikirim game.
+    const rw = rewardFor(c.amount, (await getBalance(env)).values.gemRate);
+    const gems = await mint(env, u.id, 'gem', rw.gems, `Top-up Saweria ${rp(c.amount)} (${rw.label})`, 'cr:' + id);
+    const out = { id, gems: gems ? rw.gems : 0, label: rw.label };
+    if (rw.starter) {
+      const starterOk = await mint(env, u.id, 'coin', rw.cash, 'Paket Pemula: kas tambahan', 'starter:' + u.id);
+      out.cash = starterOk ? rw.cash : 0; out.starter = starterOk; out.starterId = id;
+    }
+    rewards.push(out);
   }
-  return { ok: true, acked: n };
+  return { ok: true, acked: n, rewards, wallet: walletView(await walletFor(env, u.id)) };
 }
 
 /* ---------- API pengelola (pembayaran tanpa ID Pemain yang valid) ---------- */
-function adminEmails(env) { return String(env.ADMIN_EMAILS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean); }
-// admin = kunci ADMIN_KEY (skrip) atau sesi Google yang emailnya ada di ADMIN_EMAILS (halaman admin.html)
+const csvSet = (v) => new Set(String(v || '').split(',').map((x) => x.trim()).filter(Boolean));
+// Admin = kunci ADMIN_KEY (skrip) atau sesi Google terverifikasi yang sub-nya ada di
+// ADMIN_SUBS (utama) / email-nya ada di ADMIN_EMAILS (fallback kompatibilitas).
+function isAdminUser(u, env) {
+  if (!u || !u.sub) return false;
+  const subs = csvSet(env.ADMIN_SUBS);
+  if (subs.size) return subs.has(u.sub);
+  const emails = new Set([...csvSet(env.ADMIN_EMAILS)].map((x) => x.toLowerCase()));
+  return !!u.email && emails.has(String(u.email).toLowerCase());
+}
 async function adminOnly(req, env) {
   const h = req.headers.get('Authorization') || '';
   if (env.ADMIN_KEY && timingSafeEqual(h, 'Bearer ' + env.ADMIN_KEY)) return { email: 'admin-key' };
   const u = await sessionUser(req, env);
-  if (!u.email || !adminEmails(env).includes(String(u.email).toLowerCase())) throw httpErr(403, 'forbidden');
+  if (!isAdminUser(u, env)) throw httpErr(403, 'forbidden');
   return u;
 }
 // catat pembayaran secara manual (mis. webhook tidak sampai karena backend belum online)
@@ -163,15 +212,16 @@ async function manualCredit(req, env) {
 }
 async function adminCheck(req, env) {
   const u = await sessionUser(req, env);
-  return { admin: !!u.email && adminEmails(env).includes(String(u.email).toLowerCase()), email: u.email, name: u.name };
+  return { admin: isAdminUser(u, env), email: u.email, name: u.name };
 }
 /* ---------- keseimbangan game: versi bernomor + catatan perubahan ---------- */
 async function getBalance(env) {
   const { results } = await env.DB.prepare('SELECT version, vals, note, changes, by_email, created_at FROM balance ORDER BY version DESC LIMIT 30').all();
   const rows = results || [];
   if (!rows.length) return { version: 0, values: {}, log: [] };
+  const mask = (s) => String(s || '').replace(/^(.).*(@.*)$/, '$1***$2'); // email admin tidak dipajang publik
   return { version: rows[0].version, values: JSON.parse(rows[0].vals || '{}'),
-    log: rows.map((r) => ({ version: r.version, note: r.note || '', changes: JSON.parse(r.changes || '[]'), by: r.by_email || '', at: r.created_at })) };
+    log: rows.map((r) => ({ version: r.version, note: r.note || '', changes: JSON.parse(r.changes || '[]'), by: mask(r.by_email), at: r.created_at })) };
 }
 async function putBalance(req, env) {
   const u = await adminOnly(req, env);
@@ -210,7 +260,7 @@ const SESSION_DAYS = 30;
 let jwksCache = { keys: null, at: 0 };
 async function googleKeys(env, force) {
   if (!force && jwksCache.keys && Date.now() - jwksCache.at < 3600e3) return jwksCache.keys;
-  const r = await fetch(env.GOOGLE_JWKS_URL || 'https://www.googleapis.com/oauth2/v3/certs');
+  const r = await fetch('https://www.googleapis.com/oauth2/v3/certs');
   if (!r.ok) throw httpErr(502, 'google_keys');
   jwksCache = { keys: (await r.json()).keys || [], at: Date.now() };
   return jwksCache.keys;
@@ -233,7 +283,8 @@ async function verifyGoogleIdToken(token, env) {
   const auds = String(env.GOOGLE_CLIENT_ID || '').split(',').map((x) => x.trim()).filter(Boolean);
   if (!['accounts.google.com', 'https://accounts.google.com'].includes(payload.iss)) throw httpErr(401, 'bad_issuer');
   if (!auds.length || !auds.includes(payload.aud)) throw httpErr(401, 'bad_audience');
-  if (!(payload.exp > now - 60)) throw httpErr(401, 'expired');
+  if (!(payload.exp > now + 30)) throw httpErr(401, 'expired');
+  if (payload.iat > now + 60 || (payload.nbf && payload.nbf > now + 30)) throw httpErr(401, 'bad_time');
   if (!payload.sub) throw httpErr(401, 'no_subject');
   return payload;
 }
@@ -245,6 +296,8 @@ function publicUser(u) { return u && { id: u.id, name: u.name, given: u.given ||
 async function googleLogin(req, env) {
   const { credential } = await req.json().catch(() => ({}));
   const p = await verifyGoogleIdToken(credential, env);
+  // Setiap sesi yang terbit harus berasal dari email Google yang terverifikasi.
+  if (p.email_verified !== true) throw httpErr(403, 'email_unverified');
   const id = 'g:' + p.sub, now = Date.now();
   let u = await env.DB.prepare('SELECT * FROM users WHERE id = ?1').bind(id).first();
   if (!u) {
@@ -278,11 +331,57 @@ async function logout(req, env) {
   return { ok: true };
 }
 
+/* ---------- dompet otoritatif ---------- */
+async function getWallet(req, env) {
+  const u = await sessionUser(req, env);
+  const w = await walletFor(env, u.id);
+  const { results } = await env.DB.prepare(
+    'SELECT cur, delta, reason, created_at FROM wallet_ops WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 30'
+  ).bind(u.id).all();
+  return { wallet: walletView(w), ledger: results || [] };
+}
+async function syncWallet(req, env) {
+  const u = await sessionUser(req, env);
+  const b = await req.json().catch(() => ({}));
+  const seq = Math.round(Number(b.seq) || 0);
+  if (seq <= 0 || seq > 1e12) throw httpErr(400, 'invalid_seq');
+  let w = await walletFor(env, u.id);
+  if (seq <= w.seq) return { ok: true, duplicate: true, wallet: walletView(w) };
+  if (seq > w.seq + 1) throw httpErr(409, 'seq_gap');
+
+  // Kenaikan dibatasi laju: klien boleh mencatat pendapatan gameplay, tetapi tidak boleh
+  // menaikkan saldo seketika ke angka sembarangan. Penurunan (belanja) dicek saldonya.
+  const elapsed = Math.max(2000, Date.now() - w.updated_at);
+  const hours = Math.min(24, elapsed / 3600000);
+  const capCoin = Math.round(5e6 * hours), capGem = Math.round(200 * hours);
+  let dc = Math.round(num(b.coin, -MAX_COIN, MAX_COIN)) - w.coin;
+  let dg = Math.round(num(b.gem, -MAX_GEM, MAX_GEM)) - w.gem;
+  const clamped = dc > capCoin || dg > capGem;
+  // `ver` adalah versi dompet terakhir yang dilihat klien. Bila tertinggal (top-up/klaim
+  // belum di-ack, atau sinkron dari perangkat lain), saldo lama tidak boleh dipakai untuk
+  // menurunkan saldo server.
+  if (Math.round(num(b.ver, 0, 1e12)) < w.version) { dc = Math.max(dc, 0); dg = Math.max(dg, 0); }
+  dc = Math.max(Math.min(dc, capCoin), -w.coin);
+  dg = Math.max(Math.min(dg, capGem), -w.gem);
+
+  const now = Date.now(), v = w.version + 1, ops = [];
+  if (dc) ops.push(env.DB.prepare('INSERT INTO wallet_ops (idem, user_id, cur, delta, reason, version, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)')
+    .bind('sync:' + seq + ':c', u.id, 'coin', dc, 'Sinkron game', v, now));
+  if (dg) ops.push(env.DB.prepare('INSERT INTO wallet_ops (idem, user_id, cur, delta, reason, version, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)')
+    .bind('sync:' + seq + ':g', u.id, 'gem', dg, 'Sinkron game', v, now));
+  ops.push(env.DB.prepare('UPDATE wallets SET coin = coin + ?1, gem = gem + ?2, version = ?3, seq = ?4, updated_at = ?5 WHERE user_id = ?6')
+    .bind(dc, dg, v, seq, now, u.id));
+  await env.DB.batch(ops);
+  w = await walletFor(env, u.id);
+  return { ok: true, wallet: walletView(w), applied: { coin: dc, gem: dg }, clamped };
+}
+
 /* ---------- simpanan cloud ---------- */
 async function getSave(req, env) {
   const u = await sessionUser(req, env);
   const r = await env.DB.prepare('SELECT blob, saved_at, v FROM saves WHERE user_id = ?1').bind(u.id).first();
-  return r ? { blob: r.blob, savedAt: r.saved_at, v: r.v } : {};
+  const w = await walletFor(env, u.id);
+  return r ? { blob: r.blob, savedAt: r.saved_at, v: r.v, wallet: walletView(w) } : { wallet: walletView(w) };
 }
 async function putSave(req, env) {
   const u = await sessionUser(req, env);
@@ -290,8 +389,17 @@ async function putSave(req, env) {
   if (typeof b.blob !== 'string' || b.blob.length > 950000 || !Number.isFinite(+b.savedAt)) throw httpErr(400, 'invalid');
   const cur = await env.DB.prepare('SELECT saved_at FROM saves WHERE user_id = ?1').bind(u.id).first();
   if (cur && cur.saved_at > +b.savedAt && !b.force) { const e = httpErr(409, 'newer_on_server'); e.extra = { savedAt: cur.saved_at }; throw e; }
+  // Dompet di dalam blob sudah tidak dipercaya: selalu timpa dengan saldo server.
+  let blob = b.blob;
+  try {
+    const obj = JSON.parse(b.blob);
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      obj.wallet = walletView(await walletFor(env, u.id));
+      blob = JSON.stringify(obj);
+    }
+  } catch {}
   await env.DB.prepare('INSERT OR REPLACE INTO saves (user_id, blob, saved_at, v, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)')
-    .bind(u.id, b.blob, Math.round(+b.savedAt), Math.round(+b.v || 0), Date.now()).run();
+    .bind(u.id, blob, Math.round(+b.savedAt), Math.round(+b.v || 0), Date.now()).run();
   return { ok: true, savedAt: Math.round(+b.savedAt) };
 }
 
@@ -301,10 +409,18 @@ const num = (x, lo, hi) => Math.min(hi, Math.max(lo, Number(x) || 0));
 async function submitScore(req, env) {
   const u = await sessionUser(req, env);
   const b = await req.json().catch(() => ({}));
+  // Klien tidak lagi mengirim `score`. Skor dihitung dari dompet server + statistik
+  // yang dibatasi dan tidak boleh mundur.
+  const w = await walletFor(env, u.id);
+  const prev = await env.DB.prepare('SELECT lvl, done, day FROM leaderboard WHERE user_id = ?1').bind(u.id).first();
+  const lvl = Math.max(prev ? prev.lvl : 1, Math.round(num(b.lvl, 1, 999)));
+  const done = Math.max(prev ? prev.done : 0, Math.round(num(b.done, 0, 1e9)));
+  const day = Math.max(prev ? prev.day : 1, Math.round(num(b.day, 1, 1e6)));
+  const rep = Math.round(num(b.rep, 0, 5) * 100) / 100;
+  const score = Math.round(w.coin + w.gem * 5000 + lvl * 500000 + done * 50000 + rep * 200000 + day * 100000);
   await env.DB.prepare('INSERT OR REPLACE INTO leaderboard (user_id, shop, score, lvl, rep, done, day, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)')
-    .bind(u.id, clip(b.shop, 32) || 'Laundry', Math.round(num(b.score, 0, 1e13)), Math.round(num(b.lvl, 1, 999)), Math.round(num(b.rep, 0, 5) * 100) / 100,
-      Math.round(num(b.done, 0, 1e9)), Math.round(num(b.day, 1, 1e6)), Date.now()).run();
-  return { ok: true };
+    .bind(u.id, clip(b.shop, 32) || 'Laundry', score, lvl, rep, done, day, Date.now()).run();
+  return { ok: true, score };
 }
 const LB_COLS = 'l.user_id AS id, l.shop, l.score, l.lvl, l.rep, l.done, l.day, u.given, u.name, u.picture, u.code';
 async function friendIds(env, uid) {
@@ -401,7 +517,7 @@ function corsHeaders(env, req) {
   return {
     'Access-Control-Allow-Origin': origin && list.includes(origin) ? origin : (list[0] || ''),
     'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Player-Token, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     Vary: 'Origin',
   };
 }
@@ -421,6 +537,17 @@ async function submitTour(req, env) {
   await env.DB.prepare('INSERT OR REPLACE INTO tour (user_id, wk, kind, score, shop, updated_at) VALUES (?1,?2,?3,?4,?5,?6)')
     .bind(u.id, b.wk, clip(b.kind, 16) || 'orders', Math.round(num(b.score, 0, 1e13) * 100) / 100, clip(b.shop, 32) || 'Laundry', Date.now()).run();
   return { ok: true };
+}
+async function claimTour(req, env) {
+  const u = await sessionUser(req, env);
+  const wk = String((await req.json().catch(() => ({}))).wk || '');
+  if (!WK_RE.test(wk)) throw httpErr(400, 'invalid_week');
+  const mine = await env.DB.prepare('SELECT score FROM tour WHERE user_id = ?1 AND wk = ?2').bind(u.id, wk).first();
+  if (!mine) throw httpErr(404, 'no_score');
+  const rank = (await env.DB.prepare('SELECT COUNT(*) AS n FROM tour WHERE wk = ?1 AND score > ?2').bind(wk, mine.score).first()).n + 1;
+  const prize = rank <= 3 ? [100, 60, 40][rank - 1] : rank <= 10 ? 20 : 5;
+  const granted = await mint(env, u.id, 'gem', prize, `Hadiah turnamen ${wk} (peringkat #${rank})`, 'tour:' + wk);
+  return { ok: true, rank, prize: granted ? prize : 0, wallet: walletView(await walletFor(env, u.id)) };
 }
 async function tourBoard(req, env, url) {
   const u = await sessionUser(req, env);

@@ -1,0 +1,10 @@
+{
+  "name": "juragan-laundry-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:smoke": "node test/auth.test.mjs; node test/balance.test.mjs"
+  }
+}

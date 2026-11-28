@@ -35,6 +35,28 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_by_user ON sessions (user_id);
+
+-- Dompet otoritatif (Fase 1): saldo coin/gem hanya diubah Worker lewat ledger,
+-- bukan dipercaya dari blob simpanan klien.
+CREATE TABLE IF NOT EXISTS wallets (
+  user_id     TEXT PRIMARY KEY,
+  coin        INTEGER NOT NULL DEFAULT 5000000,
+  gem         INTEGER NOT NULL DEFAULT 20,
+  version     INTEGER NOT NULL DEFAULT 0,
+  seq         INTEGER NOT NULL DEFAULT 0,
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wallet_ops (
+  idem        TEXT PRIMARY KEY,             -- kunci idempotensi: cr:<id>, tour:<wk>, sync:<seq>:<cur>
+  user_id     TEXT NOT NULL,
+  cur         TEXT NOT NULL,                -- 'coin' | 'gem'
+  delta       INTEGER NOT NULL,
+  reason      TEXT,
+  version     INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS wallet_ops_by_user ON wallet_ops (user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS saves (
   user_id     TEXT PRIMARY KEY,
   blob        TEXT NOT NULL,

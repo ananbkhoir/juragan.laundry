@@ -1,15 +1,15 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs'; import crypto from 'node:crypto';
 import worker,{_test} from '../src/worker.js';
-const sql=new DatabaseSync(':memory:'); sql.exec(fs.readFileSync('../schema.sql','utf8'));
+const sql=new DatabaseSync(':memory:'); sql.exec(fs.readFileSync(new URL('../schema.sql',import.meta.url),'utf8'));
 const DB={prepare:(q)=>{let args=[];const st=sql.prepare(q.replace(/\?\d+/g,m=>'?'+m.slice(1)));const o={bind:(...a)=>{args=a;return o},
-  run:async()=>{const r=st.run(...args);return{meta:{changes:Number(r.changes)}}},first:async()=>st.get(...args)??null,all:async()=>({results:st.all(...args)})};return o}};
+  run:async()=>{const r=st.run(...args);return{meta:{changes:Number(r.changes)}}},first:async()=>st.get(...args)??null,all:async()=>({results:st.all(...args)})};return o},batch:async(arr)=>{const out=[];for(const s of arr)out.push(await s.run());return out}};
 const env={DB,SAWERIA_STREAM_KEY:'sk',ADMIN_KEY:'adm',ALLOWED_ORIGIN:'https://game.test,http://localhost:8099',GOOGLE_CLIENT_ID:'cid.apps.googleusercontent.com'};
 const {publicKey,privateKey}=crypto.generateKeyPairSync('rsa',{modulusLength:2048});
 const jwk={...publicKey.export({format:'jwk'}),kid:'k1',alg:'RS256',use:'sig'};
 globalThis.fetch=async(u)=>new Response(JSON.stringify({keys:[jwk]}),{status:200});
 const b64=o=>Buffer.from(typeof o==='string'?o:JSON.stringify(o)).toString('base64url');
-const idt=(p,key=privateKey,kid='k1')=>{const h=b64({alg:'RS256',kid,typ:'JWT'}),b=b64({iss:'https://accounts.google.com',aud:env.GOOGLE_CLIENT_ID,exp:Math.floor(Date.now()/1000)+600,iat:Math.floor(Date.now()/1000),...p});
+const idt=(p,key=privateKey,kid='k1')=>{const h=b64({alg:'RS256',kid,typ:'JWT'}),b=b64({iss:'https://accounts.google.com',aud:env.GOOGLE_CLIENT_ID,exp:Math.floor(Date.now()/1000)+600,iat:Math.floor(Date.now()/1000),email_verified:true,...p});
   const sig=crypto.sign('RSA-SHA256',Buffer.from(h+'.'+b),key).toString('base64url');return h+'.'+b+'.'+sig};
 const call=async(path,opt={},tok)=>{const r=await worker.fetch(new Request('https://w.test'+path,{...opt,headers:{'Content-Type':'application/json','Origin':'http://localhost:8099',...(tok?{Authorization:'Bearer '+tok}:{}),...(opt.headers||{})}}),env);let j=null;try{j=await r.json()}catch{};return{s:r.status,j,cors:r.headers.get('Access-Control-Allow-Origin')}};
 const login=(p)=>call('/api/auth/google',{method:'POST',body:JSON.stringify({credential:idt(p)})});
@@ -45,3 +45,7 @@ const p={version:'2022.01',id:'tx9',type:'donation',amount_raw:15000,donator_nam
 await worker.fetch(new Request('https://w.test/saweria/webhook',{method:'POST',headers:{'Saweria-Callback-Signature':crypto.createHmac('sha256','sk').update(['version','id','amount_raw','donator_name','donator_email'].map(k=>p[k]).join('')).digest('hex')},body:JSON.stringify(p)}),env);
 console.log('credits B',(await call('/api/credits',{},B)).j,'ack',(await call('/api/credits/ack',{method:'POST',body:JSON.stringify({ids:['tx9']})},B)).j,'A cannot ack',(await call('/api/credits/ack',{method:'POST',body:JSON.stringify({ids:['tx9']})},A)).s);
 console.log('logout',(await call('/api/logout',{method:'POST'},A)).j,(await call('/api/me',{},A)).s);
+console.log('unverified email',(await call('/api/auth/google',{method:'POST',body:JSON.stringify({credential:idt({sub:'9',email:'x@x.com',email_verified:false})})})).s); // 403
+console.log('legacy register',(await call('/api/register',{method:'POST',body:JSON.stringify({code:'JL-AAAAAA',token:'x'.repeat(30)})})).s); // 404
+console.log('legacy token credits',(await call('/api/credits?player=JL-AAAAAA')).s); // 401
+console.log('webhook tanpa key',(await worker.fetch(new Request('https://w.test/saweria/webhook',{method:'POST',headers:{'Saweria-Callback-Signature':'x'},body:'{}'}),{...env,SAWERIA_STREAM_KEY:''})).status); // 500
